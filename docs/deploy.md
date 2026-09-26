@@ -60,15 +60,16 @@ wfs-server.exe doctor C
 ```
 volume C:
   open \\.\C:            ok
-  FSCTL_GET_USN_JOURNAL   : ok - id 0x1d95f206cae361d, next_usn 49521681376, lowest_valid 0, max 64 MB, record versions (2, 4)
+  FSCTL_QUERY_USN_JOURNAL: ok - id 0x1d95f206cae361d, next_usn 49521681376, lowest_valid 0, max 64 MB, record versions (2, 4)
   ensure USN journal      : ok - id 0x1d95f206cae361d
-  FSCTL_ENUM_USN_DATA     : ok - 1433097 records (accepted 24-byte input, first entry "System Volume Information")
+  FSCTL_ENUM_USN_DATA     : ok - 1433097 records (24-byte input, first entry "System Volume Information")
   FSCTL_READ_USN_JOURNAL  : ok - 0 pending events, next_usn 49521681376
 ```
 
 任一行失败即打印 `FAILED - <原因>` 并以 exit code 1 结束(便于脚本判断)。`open` 失败且原因是
-`access denied` 时说明当前进程没提升;`accepted 32-byte input` 表示内核只接受带版本号的
-`MFT_ENUM_DATA_V1`(新版本 Windows 可能如此,引擎会自动切换)。
+`access denied` 时说明当前进程没提升;`32-byte input` 表示内核只接受带版本号的
+`MFT_ENUM_DATA_V1`(新版本 Windows 可能如此,引擎会自动切换);`0 records` 说明枚举被内核
+当场判定为空(历史上是 `HighUsn` 写成了 `u64::MAX`,即有符号 USN 域里的 -1)。
 
 ## 数据与配置
 

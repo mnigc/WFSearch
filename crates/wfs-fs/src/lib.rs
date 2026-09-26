@@ -16,11 +16,16 @@ use std::ptr::{null, null_mut};
 use wfs_core::IndexEvent;
 use wfs_core::JournalPos;
 
-// FSCTL control codes (Win32::System::Ioctl values, frozen ABI)
-pub const FSCTL_ENUM_USN_DATA: u32 = 0x0009_00b3;
-pub const FSCTL_CREATE_USN_JOURNAL: u32 = 0x0009_00e7;
-pub const FSCTL_READ_USN_JOURNAL: u32 = 0x0009_00bb;
-pub const FSCTL_GET_USN_JOURNAL: u32 = 0x0009_00f0;
+// FSCTL control codes: CTL_CODE(FILE_DEVICE_FILE_SYSTEM = 0x0009, function,
+// method, FILE_ANY_ACCESS), i.e. 0x0009_0000 | function << 2 | method. The
+// function numbers are frozen and checked against winioctl.h. Note that
+// function 60 is FSCTL_EXTEND_VOLUME, not a journal ioctl: asking it for
+// journal data is rejected by NTFS (win32 error 87) and, on a driver that
+// took the request at face value, would grow the volume.
+pub const FSCTL_ENUM_USN_DATA: u32 = 0x0009_00b3; // fn 44, METHOD_NEITHER
+pub const FSCTL_CREATE_USN_JOURNAL: u32 = 0x0009_00e7; // fn 57, METHOD_NEITHER
+pub const FSCTL_READ_USN_JOURNAL: u32 = 0x0009_00bb; // fn 46, METHOD_NEITHER
+pub const FSCTL_QUERY_USN_JOURNAL: u32 = 0x0009_00f4; // fn 61, METHOD_BUFFERED
 
 // Win32 error codes we branch on
 const ERROR_ACCESS_DENIED: u32 = 5;
@@ -155,7 +160,7 @@ fn dio_on(
     }
 }
 
-/// Snapshot of `FSCTL_GET_USN_JOURNAL` output.
+/// Snapshot of `FSCTL_QUERY_USN_JOURNAL` output.
 #[derive(Debug, Clone, Copy)]
 pub struct JournalInfo {
     pub journal_id: u64,
@@ -202,7 +207,7 @@ pub fn resume_position(saved: JournalPos, live: &JournalInfo) -> Option<JournalP
 pub struct VolumeHandle {
     drive: char,
     handle: isize,
-    /// Length of the `MFT_ENUM_DATA` input the driver accepted (24 = V0,
+    /// Length of the `MFT_ENUM_DATA` input last handed to the driver (24 = V0,
     /// 32 = V1); 0 before the first enumeration. Diagnostic only.
     enum_input_len: Cell<u32>,
 }
@@ -246,8 +251,8 @@ impl VolumeHandle {
         self.drive
     }
 
-    /// `MFT_ENUM_DATA` input length the driver accepted, or 0 when no
-    /// enumeration has run yet.
+    /// `MFT_ENUM_DATA` input length in use, or 0 when no enumeration has run
+    /// yet.
     pub fn enum_input_len(&self) -> u32 {
         self.enum_input_len.get()
     }
@@ -262,7 +267,7 @@ impl VolumeHandle {
     /// wants to hand out V1 refuses a buffer sized for V0 alone.
     pub fn journal_info(&self) -> Result<JournalInfo, FsError> {
         let mut out = [0u8; 128];
-        match self.dio(FSCTL_GET_USN_JOURNAL, None, Some(&mut out)) {
+        match self.dio(FSCTL_QUERY_USN_JOURNAL, None, Some(&mut out)) {
             Ok(n) if n >= 56 => Ok(JournalInfo {
                 journal_id: rd_u64(&out, 0),
                 first_usn: rd_u64(&out, 8) as i64,
@@ -271,14 +276,14 @@ impl VolumeHandle {
                 max_usn: rd_u64(&out, 32) as i64,
                 maximum_size: rd_u64(&out, 40),
                 allocation_delta: rd_u64(&out, 48),
-                record_versions: if n >= 64 {
+                record_versions: if n >= 60 {
                     (rd_u16(&out, 56), rd_u16(&out, 58))
                 } else {
                     (0, 0)
                 },
             }),
             Ok(n) => Err(FsError::Other(format!(
-                "short FSCTL_GET_USN_JOURNAL reply ({n} bytes)"
+                "short FSCTL_QUERY_USN_JOURNAL reply ({n} bytes)"
             ))),
             Err(e) => Err(win_err(e)),
         }
@@ -327,13 +332,19 @@ impl VolumeHandle {
         // MaxMajorVersion (2 = USN_RECORD_V2). Newer drivers reject the V0
         // length outright, so start with V0 and retry once with V1.
         let mut med = [0u8; 32];
-        med[16..24].copy_from_slice(&u64::MAX.to_le_bytes()); // HighUsn
+        // HighUsn is a USN, i.e. signed: -1 (u64::MAX) is *below* every real
+        // USN and filters out the whole MFT, so the enumeration comes back as
+        // an immediate end-of-file. MAXLONGLONG is the documented "all".
+        med[16..24].copy_from_slice(&i64::MAX.to_le_bytes()); // HighUsn
         med[24..26].copy_from_slice(&2u16.to_le_bytes()); // MinMajorVersion
         med[26..28].copy_from_slice(&2u16.to_le_bytes()); // MaxMajorVersion
         let mut len = 24usize;
         let mut start_frn: u64 = 0;
         loop {
             med[0..8].copy_from_slice(&start_frn.to_le_bytes());
+            // Recorded before the call so a failure still names the struct the
+            // driver was handed (V0 vs the fallback V1).
+            self.enum_input_len.set(len as u32);
             let returned = match self.dio(FSCTL_ENUM_USN_DATA, Some(&med[..len]), Some(&mut buf)) {
                 Ok(n) => n,
                 Err(ERROR_HANDLE_EOF) => return Ok(()),
@@ -346,7 +357,6 @@ impl VolumeHandle {
                 }
                 Err(e) => return Err(win_err(e)),
             };
-            self.enum_input_len.set(len as u32);
             if returned < 8 {
                 return Ok(());
             }

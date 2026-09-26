@@ -119,7 +119,7 @@ fn doctor(config: &Config, drives: Vec<String>) -> anyhow::Result<()> {
         println!("  open \\\\.\\{d}:            ok");
         match vol.journal_info() {
             Ok(j) => println!(
-                "  FSCTL_GET_USN_JOURNAL   : ok - id {:#x}, next_usn {}, lowest_valid {}, max {} MB, record versions {:?}",
+                "  FSCTL_QUERY_USN_JOURNAL: ok - id {:#x}, next_usn {}, lowest_valid {}, max {} MB, record versions {:?}",
                 j.journal_id,
                 j.next_usn,
                 j.lowest_valid_usn,
@@ -127,7 +127,7 @@ fn doctor(config: &Config, drives: Vec<String>) -> anyhow::Result<()> {
                 j.record_versions
             ),
             Err(e) => {
-                println!("  FSCTL_GET_USN_JOURNAL   : FAILED - {e}");
+                println!("  FSCTL_QUERY_USN_JOURNAL: FAILED - {e}");
                 failed = true;
             }
         }
@@ -147,7 +147,7 @@ fn doctor(config: &Config, drives: Vec<String>) -> anyhow::Result<()> {
             records += 1;
         }) {
             Ok(()) => println!(
-                "  FSCTL_ENUM_USN_DATA     : ok - {records} records (accepted {}-byte input, first entry {:?})",
+                "  FSCTL_ENUM_USN_DATA     : ok - {records} records ({}-byte input, first entry {:?})",
                 vol.enum_input_len(),
                 first
             ),
