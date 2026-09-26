@@ -7,4 +7,3 @@ description = "NTFS MFT enumeration and USN journal reader for WFSearch"
 
 [dependencies]
 wfs-core = { workspace = true }
-tracing = { workspace = true }
