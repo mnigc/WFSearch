@@ -7,6 +7,7 @@
 *整卷 NTFS MFT 常驻内存索引 · USN Journal 实时增量 · Named Pipe + 本地 HTTP 查询。*
 
 [![CI](https://github.com/mnigc/WFSearch/actions/workflows/ci.yml/badge.svg)](https://github.com/mnigc/WFSearch/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Windows%20NTFS-0078D6)
 ![Language](https://img.shields.io/badge/language-Rust-dea584)
 

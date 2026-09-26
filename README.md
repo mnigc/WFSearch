@@ -7,6 +7,7 @@
 *The whole NTFS MFT indexed in memory — live USN Journal updates — queried over Named Pipe & local HTTP.*
 
 [![CI](https://github.com/mnigc/WFSearch/actions/workflows/ci.yml/badge.svg)](https://github.com/mnigc/WFSearch/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Windows%20NTFS-0078D6)
 ![Language](https://img.shields.io/badge/language-Rust-dea584)
 
