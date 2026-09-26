@@ -1,139 +1,165 @@
-[中文](README.md) | [English](README.en.md)
+<div align="center">
 
-# WFSearch — Windows 文件搜索底层服务
+# 🔍 WFSearch
 
-一个 Everything 风格的**文件名搜索引擎**:直接读取 NTFS MFT 建立全量内存索引,用 USN Journal 做实时增量更新,通过 **Named Pipe + 本地 HTTP** 供任意应用程序查询。目标是**速度极快、占用极低**:
+**Blazing-fast filename search for Windows.**
 
-| 指标 | 目标 | 实测¹ |
+*The whole NTFS MFT indexed in memory — live USN Journal updates — queried over Named Pipe & local HTTP.*
+
+[![CI](https://github.com/mnigc/WFSearch/actions/workflows/ci.yml/badge.svg)](https://github.com/mnigc/WFSearch/actions/workflows/ci.yml)
+![Platform](https://img.shields.io/badge/platform-Windows%20NTFS-0078D6)
+![Language](https://img.shields.io/badge/language-Rust-dea584)
+
+English · [中文](README.zh.md)
+
+</div>
+
+---
+
+## ✨ Highlights
+
+- ⚡ **Millisecond queries** — substring + `*`/`?` wildcards over a million files at P99 ≈ 10 ms, case-insensitive with Unicode folding (CJK included)
+- 🗂️ **Full-volume index in seconds** — reads the NTFS MFT directly; 1.25 M files in ~2 s
+- 🔄 **Live updates** — USN Journal polled every 100 ms, changes visible in < 100 ms; automatic full rebuild on journal wrap
+- 🪶 **Tiny footprint** — ≈ 87 bytes per file (~103 MB for 1.25 M entries), ~0% idle CPU
+- 🔌 **Two transports, one protocol** — Named Pipe for lowest latency, loopback HTTP for scripts & web; identical JSON payloads
+- 🩺 **Self-diagnosing** — `doctor` probes every ioctl step by step; an acceptance script measures all targets on real hardware
+
+> **v1 scope:** filename/path search only. Full-text content search, pinyin matching, and ReFS/network drives are out of scope.
+
+## 📊 Performance
+
+| Metric | Target | Measured ¹ |
 |---|---|---|
-| 全量索引(百万文件,SSD) | < 15 s | **2.2 s**(124.6 万文件) |
-| 单次查询(百万文件) | < 30 ms(P99) | **10.0 ms**(引擎)/ 14.7 ms(HTTP 往返) |
-| 空闲 CPU | ≈ 0%(100ms 一次 journal 轮询,单次 syscall) | —(脚本未覆盖) |
-| 内存 | ≤ ~100 MB / 百万文件 | **87 B / 文件**(约 103 MB) |
-| 变更可见延迟 | ≤ 1 s | **创建 72 ms / 删除 75 ms** |
-| 带有效快照重启恢复 | ≤ 3 s | **0.5 s** |
+| 🗂️ Full index (1M files, SSD) | < 15 s | **2.2 s** (1.25 M files) |
+| ⚡ Single query (1M files, P99) | < 30 ms | **10.0 ms** engine · 14.7 ms HTTP round trip |
+| 🪶 Memory | ≤ ~100 MB / 1M files | **87 B / file** (~103 MB) |
+| 🔄 Change visibility | ≤ 1 s | **create 72 ms · delete 75 ms** |
+| 🔁 Restart with valid snapshot | ≤ 3 s | **0.5 s** |
+| 🌙 Idle CPU | ≈ 0% | — (not covered by the script) |
 
-> ¹ 实测来自 2026-09-26 的一次真实盘验收(C 盘,124.6 万文件,管理员终端运行
-> [`scripts/acceptance.ps1`](scripts/acceptance.ps1)),五项门禁全部 PASS。
-> 换机器请重跑该脚本,以本机输出为准;查询引擎的合成基准见
-> [docs/benchmarks.md](docs/benchmarks.md)。
+> ¹ One real-disk run (2026-09-26, drive C:, 1.25 M files, elevated console) of
+> [`scripts/acceptance.ps1`](scripts/acceptance.ps1) — all five gates PASS. Rerun it on
+> your own hardware and trust your numbers. Synthetic query-engine benchmarks:
+> [docs/benchmarks.en.md](docs/benchmarks.en.md).
 
-> v1 范围:**仅文件名/路径搜索**(子串 + `*` `?` 通配符,大小写不敏感,支持中文)。内容全文检索、拼音匹配、ReFS/网络盘不在本期范围。
-
-## 验证状态
-
-| 项目 | 状态 | 依据 |
-|---|---|---|
-| 查询引擎(匹配语义、排序、路径匹配) | **已验证** | 20 个单测 + criterion 基准(合成 100 万条) |
-| 协议 JSON 契约(pipe/HTTP 载荷) | **已验证** | wfs-proto 契约测试 + pipe/HTTP 端到端测试(真实管道与 socket) |
-| 快照格式(写入/校验/拒绝损坏镜像) | **已验证** | 往返测试 + 损坏/异版本镜像拒绝测试 |
-| MFT 全量枚举、USN journal 增量 | **已验证** | 真实盘验收:全量构建 + 创建/删除可见延迟 < 100 ms;字节级记录解析单测(含 FRN 序列号位回归) |
-| 性能/内存目标(5/6 项) | **已验证(单机)** | acceptance.ps1 五项 PASS(实测见上表);空闲 CPU 项脚本未覆盖 |
-| 服务模式安装/SCM 生命周期 | **已实现待验证** | 代码完整;需在目标机 `install` + `sc start` 实测 |
-| 内容全文检索、拼音、ReFS/网络盘 | **未实现** | 不在 v1 范围 |
-
-
-## 工作原理
-
-```
-应用 ──Named Pipe──┐
-                   ▼
-Web ──127.0.0.1 HTTP──► wfs-server
-                          │  查询:内存线性扫描(memchr/SIMD + rayon 并行)
-                          ▼
-                      wfs-core 索引(每卷一份:名字 arena + 24B/文件节点树)
-                          ▲
-              FSCTL_ENUM_USN_DATA 全量枚举 │ FSCTL_READ_USN_JOURNAL 增量
-                          │
-                        NTFS 卷
-```
-
-- **全量构建**:一次性从卷句柄枚举全部 MFT 文件记录(FRN/父FRN/文件名),百万文件秒级。文件引用号在解析时统一剥掉高位的 NTFS 序列号(只保留 48 位记录号),父子锚定才不会失配。
-- **实时更新**:每 ~100ms 读一次 USN Journal,批量应用 create/delete/rename;journal 回绕或删除时自动全量重建。
-- **冷启动**:索引 + journal 位置序列化到 `index.bin`;重启时校验 journal 未回绕则直接续跑,否则重建。
-- **删除策略**:墓碑标记(BFS 清子树),墓碑比例超阈值自动重建回收内存。
-
-## 快速开始
+## 🚀 Quick start
 
 ```powershell
-# 1. 开发者控制台模式(需要管理员权限,MFT 访问要求提升)
+# 1️⃣ Developer console (elevated — MFT access needs an elevated token)
 cargo run --release -p wfs-server -- console
 
-# 2. 另开终端查询
+# 2️⃣ Query from another terminal
 cargo run --release -p wfs-client -- search "*.rs"     # named pipe
-cargo run --release -p wfs-client -- status --http     # HTTP 通道
-cargo run --release -p wfs-client -- search "src\core" --match-path   # 按路径匹配
-curl "http://127.0.0.1:15100/api/v1/search?q=%E9%A1%B9%E7%9B%AE&limit=10"
+cargo run --release -p wfs-client -- status --http     # HTTP channel
+cargo run --release -p wfs-client -- search "src\core" --match-path   # match on path
+curl "http://127.0.0.1:15100/api/v1/search?q=report&limit=10"
 
-# 3. 安装为 Windows 服务(管理员)
+# 3️⃣ Install as a Windows service (elevated)
 wfs-server.exe install
 sc start WFSearch
 
-# 4. 真实磁盘验收(管理员终端,跑一次拿到全部指标)
+# 4️⃣ Real-disk acceptance — one run, every metric (elevated)
 powershell -ExecutionPolicy Bypass -File scripts\acceptance.ps1
 ```
 
-REPL 命令:`直接输入查询词`、`status`、`quit`。查询语法:`report *.docx C:`(多词 AND、通配符、盘符过滤);
-词里含 `\` 或 `/` 时自动按路径匹配(`src\core`),也可用 `--match-path` 把全部词按路径匹配。
+**REPL** — type a query, or `status` / `quit`. **Query syntax** — `report *.docx C:`:
+terms are ANDed; wildcards and drive filters work; a term containing `\` or `/` matches on
+the path automatically, or force it with `--match-path`.
 
-卷起不来时先用 `doctor` 自检(管理员终端,逐步打印每个 ioctl 的结果,失败时 exit code 1):
+**Volume won't come up?** Ask the doctor (elevated; prints each ioctl's result, exit code 1 on failure):
 
 ```powershell
-wfs-server.exe doctor C        # 打开卷 / 查 journal / 全量枚举 / 读 journal 四步逐条报结果
-wfs-server.exe doctor          # 不带盘符:探测配置里(或自动识别)的所有盘
+wfs-server.exe doctor C        # open volume → query journal → full enum → read journal
+wfs-server.exe doctor          # no letters: probes every configured drive
 ```
 
-## 仓库结构
+## 🧠 How it works
+
+```
+App ──Named Pipe──┐
+                  ▼
+Web ──127.0.0.1 HTTP──► wfs-server
+                          │  query: in-memory linear scan (memchr/SIMD + rayon)
+                          ▼
+                      wfs-core index (one per volume: name arena + 24 B/file node tree)
+                          ▲
+              FSCTL_ENUM_USN_DATA full walk │ FSCTL_READ_USN_JOURNAL incrementals
+                          │
+                        NTFS volume
+```
+
+- **🗂️ Full build** — every MFT file record (FRN / parent FRN / name) enumerated in one
+  pass, seconds per million files. File references are normalized at parse time (the
+  16-bit NTFS sequence counter in the high word is stripped) so parent anchoring always resolves.
+- **🔄 Live updates** — the USN Journal is read every ~100 ms and create/delete/rename
+  events applied in batches; a wrapped or deleted journal triggers an automatic rebuild.
+- **🔁 Cold start** — index + journal position serialize to `index.bin`; a snapshot whose
+  journal hasn't wrapped resumes in seconds, otherwise the volume rebuilds.
+- **🧹 Deletes** — tombstone marking (subtree BFS); a rebuild reclaims memory once the
+  tombstone ratio crosses a threshold.
+
+## ✅ Verification status
+
+| Area | Status | Evidence |
+|---|---|---|
+| Query engine (matching, sorting, path matching) | ✅ Verified | 20 unit tests + criterion benchmarks (synthetic 1M) |
+| Protocol JSON contract (pipe & HTTP payloads) | ✅ Verified | contract tests + pipe/HTTP end-to-end tests |
+| Snapshot format (write / validate / reject) | ✅ Verified | round-trip + corrupt/foreign-version rejection tests |
+| Full MFT enum, USN journal incrementals | ✅ Verified | real-disk acceptance: build + change visibility < 100 ms; byte-level parsing tests (incl. FRN sequence-bit regression) |
+| Performance & memory targets (5 of 6) | ✅ Verified (one machine) | acceptance script: five gates PASS (table above); idle CPU not covered |
+| Service install / SCM lifecycle | 🚧 Implemented, unverified | needs an on-machine `install` + `sc start` run |
+| Full-text, pinyin, ReFS/network drives | ❌ Not in v1 | out of scope |
+
+## 📁 Repository layout
 
 ```
 crates/
-├── wfs-proto/    协议类型(JSON serde),两种传输共用(6 个契约测试)
-├── wfs-core/     内存索引 + 查询引擎(纯逻辑,20 个单测 + criterion 基准)
-├── wfs-fs/       MFT 枚举、USN Journal(手写 kernel32 FFI + 字节级记录解析,17 个单测)
-├── wfs-server/   服务二进制:console/service 模式、pipe+http、快照、SCM 生命周期
-│                 (11 个测试:含 pipe/HTTP 端到端、快照往返)
-└── wfs-client/   Rust SDK(参考实现)+ wfs-cli 调试工具(3 个测试:URL 编码 + CLI 参数回归)
+├── wfs-proto/    protocol types (JSON serde) shared by both transports — 6 contract tests
+├── wfs-core/     in-memory index + query engine (pure logic) — 20 unit tests + criterion bench
+├── wfs-fs/       MFT enum, USN Journal (hand-written kernel32 FFI, byte-level parsing) — 17 unit tests
+├── wfs-server/   service binary: console/service modes, pipe+http, snapshots, SCM — 11 tests
+└── wfs-client/   Rust SDK (reference client) + wfs-cli debug tool — 3 tests
 scripts/
-└── acceptance.ps1  真实磁盘验收(管理员跑一次:doctor 自检 + 冷/热启动、延迟、可见性,逐条 PASS/FAIL)
-docs/
-├── protocol.md        线上协议完整参考(英文:protocol.en.md)
-├── deploy.md          部署/配置/服务管理(英文:deploy.en.md)
-├── clients.md         Python / C# 接入示例(英文:clients.en.md)
-└── benchmarks.md      基准数据与 RwLock/ArcSwap 决策依据(英文:benchmarks.en.md)
+└── acceptance.ps1   real-disk acceptance: doctor + cold/warm start, latency, visibility
+docs/                bilingual docs (Chinese primary, *.en.md siblings) — see 📚 below
 ```
 
-CI(GitHub Actions,windows-latest)对 `cargo fmt --check`、`cargo clippy -D warnings`、
-`cargo test`、release 构建做门禁;`.github/workflows/ci.yml` 里的 bench job 仅手动触发。
+CI (GitHub Actions, `windows-latest`) gates `cargo fmt --check`, `clippy -D warnings`,
+`cargo test`, and the release build; the bench job is manual-dispatch only.
 
-## 配置
+## ⚙️ Configuration
 
-`%ProgramData%\WFSearch\config.toml`(不存在则用默认值;也可 `--config <FILE>` 指定):
+`%ProgramData%\WFSearch\config.toml` (defaults apply when absent; or `--config <FILE>`):
 
 ```toml
-drives = ["auto"]          # 或 ["C", "D"]
-http_port = 15100          # 仅绑定 127.0.0.1
+drives = ["auto"]          # or ["C", "D"]
+http_port = 15100          # binds 127.0.0.1 only
 pipe_name = "\\\\.\\pipe\\wfs-engine-v1"
-poll_ms = 100              # journal 轮询间隔
-max_limit = 1000           # 单次查询 limit 上限
-pipe_acl = "open"          # 管道 DACL:open(默认,本机任意用户)| restricted(仅 SYSTEM + 管理员)
+poll_ms = 100              # journal poll interval
+max_limit = 1000           # per-query limit cap
+pipe_acl = "open"          # pipe DACL: open (default) | restricted (SYSTEM + admins)
 ```
 
-`pipe_acl = "restricted"` 适用于"只有特定服务/管理员能查询"的场景;写错的值会回退到
-`open` 并在 stderr 大声告警(不会静默降级)。注意 pipe 的 ACL **不影响 HTTP 通道**:
-HTTP 始终只绑回环,但本机任何用户都能访问 —— 要完全收紧得两个通道一起考虑。
+> 💡 `pipe_acl = "restricted"` limits *pipe* queries to SYSTEM + Administrators; an invalid
+> value falls back to `open` with a loud warning — never a silent downgrade. The pipe ACL
+> does **not** constrain the HTTP channel: HTTP binds the loopback only, but any local user
+> can reach it, so tightening access fully means considering both channels.
 
-## 文档
+## 📚 Documentation
 
-- [协议参考](docs/protocol.md)([EN](docs/protocol.en.md)) — Named Pipe 帧格式 + HTTP API
-- [部署指南](docs/deploy.md)([EN](docs/deploy.en.md)) — 服务安装、配置、故障排查
-- [接入示例](docs/clients.md)([EN](docs/clients.en.md)) — Python / C# / Rust 代码
-- [基准测试](docs/benchmarks.md)([EN](docs/benchmarks.en.md)) — 实测数据、复现方式、真实磁盘验收
+| | English | 中文 |
+|---|---|---|
+| 📡 Wire protocol (pipe framing + HTTP API) | [protocol.en.md](docs/protocol.en.md) | [protocol.md](docs/protocol.md) |
+| 🛠️ Deployment, config, troubleshooting | [deploy.en.md](docs/deploy.en.md) | [deploy.md](docs/deploy.md) |
+| 🧩 Client examples (Python / C# / Rust) | [clients.en.md](docs/clients.en.md) | [clients.md](docs/clients.md) |
+| 📈 Benchmarks & acceptance results | [benchmarks.en.md](docs/benchmarks.en.md) | [benchmarks.md](docs/benchmarks.md) |
 
-## 已知边界(v1)
+## ⚠️ Known limits (v1)
 
-- 需要管理员权限(LocalSystem 服务已满足;console 模式需提升后的终端)。
-- 仅 NTFS 固定盘(USN Journal 限制);ReFS/网络驱动器不支持。
-- **路径匹配**(`match_path` 请求标志,或查询词里直接写 `\` / `/`)与 `sort=name|path`
-  都需要对每个候选物化完整路径,比名字匹配慢 5~10×(实测见
-  [benchmarks.md](docs/benchmarks.md));名字匹配才是快路径。
-- 文件大小/修改时间未索引(枚举接口不含,后续 MFT 原始记录解析可补)。
+- 🔐 Requires elevation (LocalSystem has it; console mode needs an elevated terminal).
+- 💾 NTFS fixed disks only — USN Journal limitation; ReFS/network drives unsupported.
+- 🐢 **Path matching** (`match_path`, or `\` / `/` inside a term) and `sort=name|path`
+  materialize the full path per candidate — 5–10× slower than name matching; name matching
+  is the fast path.
+- 📏 File size / mtime are not indexed (raw MFT record parsing could add them later).
