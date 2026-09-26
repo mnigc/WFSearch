@@ -10,7 +10,8 @@
     1. cold start  - process start -> phase=ready (full MFT build), memory/file
     2. query       - P50/P95/P99 of 200 searches (server-side query_ms)
     3. visibility  - create / delete seen by the index (journal poll_ms=100)
-    4. warm start  - restart from the snapshot written on shutdown
+    4. warm start  - restart from the snapshot written on shutdown, then a
+                     created file must still show up (journal watch alive)
 
   Scope: it only creates a throw-away data dir under %TEMP% and launches
   wfs-server.exe in console mode with a generated config. No service is
@@ -337,6 +338,34 @@ try {
 }
 $warmSec = $sw.Elapsed.TotalSeconds
 $warmFiles = @($warm.volumes)[0].files
+
+# A volume resumed from the snapshot must still have a live journal watch.
+# Regression: boot used to start watch threads only for freshly built volumes,
+# so a resumed index silently froze at the snapshot while still answering.
+Write-Host '      warm watch: creating a probe after snapshot resume ...'
+$warmStem = 'wfs-accept-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+$warmProbe = Join-Path $probeDir ($warmStem + '.txt')
+$warmPattern = [uri]::EscapeDataString($warmStem + '*')
+try {
+    Set-Content -Path $warmProbe -Value 'wfs'
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $warmSeen = $false
+    while ($sw.Elapsed.TotalSeconds -lt 10) {
+        $r = Get-Http -Port $port -Path "/api/v1/search?q=$warmPattern&limit=5" | ConvertFrom-Json
+        if ($r.total_matched -ge 1) { $warmSeen = $true; break }
+        Start-Sleep -Milliseconds 50
+    }
+    $sw.Stop()
+    $warmWatchMs = $sw.Elapsed.TotalMilliseconds
+    if (-not $warmSeen) {
+        throw ("created file never showed up after warm start within 10 s (probe: {0})`n      {1}" -f `
+                $warmProbe, (Format-Status -Port $port))
+    }
+} catch {
+    Stop-And-Report -Process $proc -Title 'warm watch'
+    throw
+}
+
 Stop-Engine -Process $proc
 $coldLog = Format-EngineLog $script:engineLog
 
@@ -372,6 +401,7 @@ Write-Host ''
 Write-Host '[4] warm start (snapshot resume)'
 Write-Host ("    snapshot            : index.bin {0:N1} MB" -f $snapMb)
 Write-Host ("    time to phase=ready : {0:N1} s   (files {1:N0})" -f $warmSec, $warmFiles)
+Write-Host ("    create seen after   : {0:N0} ms" -f $warmWatchMs)
 Write-Host ''
 Write-Host '[5] engine log (volume lines)'
 Write-Host ('    ' + $coldLog)
@@ -383,5 +413,6 @@ Write-Host ("query P99    < 30 ms  : {0}  ({1:N1} ms)"  -f (Verdict ($worstP99 -
 Write-Host ("memory       <= 100 B : {0}  ({1:N0} bytes/file)" -f (Verdict ($bytesPerFile -le 100 -and $bytesPerFile -gt 0)), $bytesPerFile)
 Write-Host ("visibility   <= 1 s   : {0}  (create {1:N0} ms / delete {2:N0} ms)" -f (Verdict ([Math]::Max($createMs, $deleteMs) -le 1000)), $createMs, $deleteMs)
 Write-Host ("warm restart <= 3 s   : {0}  ({1:N1} s)"  -f (Verdict ($warmSec -lt 3)), $warmSec)
+Write-Host ("warm watch   <= 1 s   : {0}  ({1:N0} ms)"  -f (Verdict ($warmWatchMs -le 1000)), $warmWatchMs)
 Write-Host '======================================================================='
 Write-Host ("artifacts kept in {0} (index.bin, config.toml)" -f $dataDir)

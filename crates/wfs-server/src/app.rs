@@ -22,12 +22,19 @@ pub fn boot(config: Config) -> anyhow::Result<App> {
     // warm start: restore whatever the snapshot can cover
     let resumed: HashMap<char, JournalPos> = snapshot::try_load(&state);
 
+    let configured = resolve_drives(&state.config);
     let mut to_build = Vec::new();
-    for d in resolve_drives(&state.config) {
-        if !resumed.contains_key(&d) {
-            to_build.push(d);
+    for d in &configured {
+        if !resumed.contains_key(d) {
+            to_build.push(*d);
         }
     }
+    // A restored volume needs a worker as much as a fresh one: the resume
+    // position only skips the full build — without the watch loop the index
+    // would silently freeze at the snapshot.
+    let mut restored: Vec<char> = resumed.keys().copied().collect();
+    restored.sort_unstable();
+    let workers = worker_drives(&configured, &restored);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -42,9 +49,22 @@ pub fn boot(config: Config) -> anyhow::Result<App> {
     }
 
     let initial_build = to_build.clone();
-    watcher::start(&state, to_build, &resumed);
+    watcher::start(&state, workers, &resumed);
     spawn_warm_snapshot(&state, initial_build);
     Ok(App { state, rt })
+}
+
+/// Every drive that gets a worker thread: everything configured, plus any
+/// snapshot-restored drive the config no longer lists. Restored drives skip
+/// the full build in their worker and resume the journal watch directly.
+fn worker_drives(configured: &[char], restored: &[char]) -> Vec<char> {
+    let mut drives = configured.to_vec();
+    for d in restored {
+        if !drives.contains(d) {
+            drives.push(*d);
+        }
+    }
+    drives
 }
 
 /// Write the snapshot once the first full build has settled, so the next start
@@ -103,5 +123,28 @@ pub(crate) fn resolve_drives(config: &Config) -> Vec<char> {
             })
             .filter(|c| c.is_ascii_alphabetic())
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cold_start_builds_every_configured_drive() {
+        assert_eq!(worker_drives(&['C', 'D'], &[]), vec!['C', 'D']);
+    }
+
+    #[test]
+    fn restored_drive_keeps_a_worker() {
+        // regression: boot used to pass only the to-build list to
+        // watcher::start, so snapshot-restored volumes got no watch thread
+        // and their indexes silently went stale
+        assert_eq!(worker_drives(&['C', 'D'], &['D']), vec!['C', 'D']);
+    }
+
+    #[test]
+    fn restored_drive_dropped_from_config_is_still_watched() {
+        assert_eq!(worker_drives(&['C'], &['C', 'E']), vec!['C', 'E']);
     }
 }
