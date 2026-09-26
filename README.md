@@ -83,7 +83,7 @@ crates/
 ├── wfs-fs/       MFT 枚举、USN Journal(手写 kernel32 FFI + 字节级记录解析,12 个单测)
 ├── wfs-server/   服务二进制:console/service 模式、pipe+http、快照、SCM 生命周期
 │                 (11 个测试:含 pipe/HTTP 端到端、快照往返)
-└── wfs-client/   Rust SDK(参考实现)+ wfs-cli 调试工具
+└── wfs-client/   Rust SDK(参考实现)+ wfs-cli 调试工具(3 个测试:URL 编码 + CLI 参数回归)
 scripts/
 └── acceptance.ps1  真实磁盘验收(管理员跑一次,逐条对照目标 PASS/FAIL)
 docs/
@@ -110,8 +110,8 @@ pipe_acl = "open"          # 管道 DACL:open(默认,本机任意用户)| restri
 ```
 
 `pipe_acl = "restricted"` 适用于"只有特定服务/管理员能查询"的场景;写错的值会回退到
-`open` 并在 stderr 大声告警(不会静默降级)。注意通道是二选一的:限制 pipe 不影响
-HTTP(HTTP 始终只绑回环,但任何本机用户都能访问)。
+`open` 并在 stderr 大声告警(不会静默降级)。注意 pipe 的 ACL **不影响 HTTP 通道**:
+HTTP 始终只绑回环,但本机任何用户都能访问 —— 要完全收紧得两个通道一起考虑。
 
 ## 文档
 
