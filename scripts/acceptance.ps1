@@ -109,12 +109,14 @@ function Wait-Status {
         }
         $status = $null
         try { $status = Get-Http -Port $Port -Path '/api/v1/status' | ConvertFrom-Json } catch { }
-        if ($null -ne $status -and $status.volumes.Count -gt 0) {
-            $failed = $status.volumes | Where-Object { $_.phase -eq 'failed' }
-            if ($failed) {
+        if ($null -ne $status -and $null -ne $status.volumes) {
+            # @() because PowerShell unwraps single-element JSON arrays
+            $vols = @($status.volumes)
+            $failed = @($vols | Where-Object { $_.phase -eq 'failed' })
+            if ($failed.Count -gt 0) {
                 throw "volume $($failed[0].drive): phase=failed - MFT access denied? this session must be elevated"
             }
-            if ($status.volumes[0].phase -eq 'ready') { return $status }
+            if ($vols[0].phase -eq 'ready') { return $status }
         }
         Start-Sleep -Milliseconds 100
     }
@@ -177,7 +179,7 @@ try {
     $sw.Stop()
 }
 $coldSec = $sw.Elapsed.TotalSeconds
-$files = $status.volumes[0].files
+$files = @($status.volumes)[0].files
 $mem = [double]$status.approx_memory_bytes
 $bytesPerFile = if ($files -gt 0) { $mem / $files } else { 0 }
 
@@ -189,8 +191,12 @@ $latencies = foreach ($q in $shapes) { Measure-Query -Port $port -Q $q -Count $R
 # --- 3. change visibility -----------------------------------------------------
 Write-Host '[4/6] change visibility (create + delete) ...'
 $stem = 'wfs-accept-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
-$probe = Join-Path $env:TEMP ($stem + '.txt')
+# the probe must live on the indexed volume (C:), whatever %TEMP% points at
+$probeDir = $env:TEMP
+if ($probeDir.Substring(0, 2).ToUpper() -ne 'C:') { $probeDir = Join-Path $env:windir 'Temp' }
+$probe = Join-Path $probeDir ($stem + '.txt')
 $pattern = [uri]::EscapeDataString($stem + '*')
+Write-Host ("      probe file: {0}" -f $probe)
 
 Set-Content -Path $probe -Value 'wfs'
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -231,7 +237,7 @@ try {
     $sw.Stop()
 }
 $warmSec = $sw.Elapsed.TotalSeconds
-$warmFiles = $warm.volumes[0].files
+$warmFiles = @($warm.volumes)[0].files
 Stop-Engine -Process $proc
 
 # --- report -------------------------------------------------------------------
