@@ -1,0 +1,10 @@
+[package]
+name = "wfs-fs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NTFS MFT enumeration and USN journal reader for WFSearch"
+
+[dependencies]
+wfs-core = { workspace = true }
+tracing = { workspace = true }

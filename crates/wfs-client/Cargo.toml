@@ -1,0 +1,16 @@
+[package]
+name = "wfs-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WFSearch client SDK (named pipe + HTTP) and wfs-cli debug tool"
+
+[dependencies]
+wfs-proto = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+
+[[bin]]
+name = "wfs-cli"
+path = "src/bin/wfs-cli.rs"

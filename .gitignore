@@ -1,0 +1,6 @@
+/target
+Cargo.lock.orig
+*.log
+/data
+# local agent/editor scratch (plans written during sessions)
+/.zcode

@@ -1,0 +1,189 @@
+//! Per-volume worker threads: full MFT build on first start, then a USN
+//! journal watch loop applying incremental events. One thread per volume;
+//! the thread owns the volume handle for its whole life.
+
+use std::collections::HashMap;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use wfs_core::{InsertOutcome, JournalPos, VolumeIndex, VolumePhase};
+use wfs_fs::{resume_position, FsError, VolumeHandle};
+
+use crate::state::AppState;
+
+/// Start one worker per drive. `resume` carries snapshot-restored journal
+/// positions — those volumes skip the full build.
+pub fn start(state: &Arc<AppState>, drives: Vec<char>, resume: &HashMap<char, JournalPos>) {
+    for d in drives {
+        let st = state.clone();
+        let r = resume.get(&d).copied();
+        let name = format!("wfs-{}", d.to_ascii_uppercase());
+        let _ = std::thread::Builder::new().name(name).spawn(move || {
+            volume_thread(st, d, r);
+        });
+    }
+}
+
+enum VolErr {
+    /// transient — sleep and retry the whole open/build
+    Retry(u64),
+    /// journal gone/wrapped or volume changed — rebuild from scratch
+    Rebuild,
+}
+
+fn volume_thread(state: Arc<AppState>, drive: char, resume: Option<JournalPos>) {
+    let mut resume = resume;
+    let mut retries: u32 = 0;
+    loop {
+        if state.stop.load(Ordering::Relaxed) {
+            return;
+        }
+        match run_volume(&state, drive, resume.take()) {
+            Ok(()) => return, // stop requested
+            Err(VolErr::Retry(ms)) => {
+                retries += 1;
+                tracing::warn!("volume {drive}: retrying in {ms}ms (attempt {retries})");
+                if retries >= 10 {
+                    tracing::error!("volume {drive}: giving up; volume marked failed");
+                    fail_volume(&state, drive);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(ms));
+            }
+            Err(VolErr::Rebuild) => {
+                tracing::info!("volume {drive}: rebuilding index from MFT");
+                retries = 0;
+            }
+        }
+    }
+}
+
+fn run_volume(
+    state: &Arc<AppState>,
+    drive: char,
+    resume: Option<JournalPos>,
+) -> Result<(), VolErr> {
+    let vol = VolumeHandle::open(drive).map_err(|_| VolErr::Retry(2000))?;
+    let pos = match resume.and_then(|p| {
+        vol.journal_info()
+            .ok()
+            .and_then(|info| resume_position(p, &info))
+    }) {
+        Some(pos) => pos,
+        None => build_volume(state, &vol, drive)?,
+    };
+    watch_loop(state, &vol, drive, pos)
+}
+
+fn build_volume(
+    state: &Arc<AppState>,
+    vol: &VolumeHandle,
+    drive: char,
+) -> Result<JournalPos, VolErr> {
+    let started = Instant::now();
+    state.build_progress.lock().unwrap().insert(drive, 0);
+    vol.ensure_journal().map_err(vol_err)?;
+
+    let mut index = VolumeIndex::new(drive);
+    let mut orphans: Vec<(u64, u64, String, bool)> = Vec::new();
+    let mut count = 0u64;
+    vol.enumerate_mft(|e| {
+        if let InsertOutcome::Orphan = index.insert(e.frn, e.parent_frn, &e.name, e.is_dir) {
+            orphans.push((e.frn, e.parent_frn, e.name, e.is_dir));
+        }
+        count += 1;
+        if count.is_multiple_of(65536) {
+            if let Some(p) = state.build_progress.lock().unwrap().get_mut(&drive) {
+                *p = index.live_count();
+            }
+        }
+    })
+    .map_err(vol_err)?;
+
+    // Parents can appear after children in MFT order — resolve iteratively.
+    let mut dropped = 0usize;
+    while !orphans.is_empty() {
+        let before = orphans.len();
+        let mut next = Vec::new();
+        for (f, p, n, d) in orphans.drain(..) {
+            if let InsertOutcome::Orphan = index.insert(f, p, &n, d) {
+                next.push((f, p, n, d));
+            }
+        }
+        if next.len() == before {
+            dropped = next.len();
+            break;
+        }
+        orphans = next;
+    }
+    if dropped > 0 {
+        tracing::warn!("volume {drive}: dropped {dropped} entries with missing parents");
+    }
+
+    // Capture the journal position AFTER the enum: every change that happened
+    // while scanning is covered by the journal from this point on.
+    let info = vol.journal_info().map_err(vol_err)?;
+    let pos = JournalPos {
+        journal_id: info.journal_id,
+        next_usn: info.next_usn as u64,
+    };
+    let files = index.live_count();
+    let elapsed = started.elapsed();
+    state
+        .engine
+        .init_volume(drive, index, Some(pos), VolumePhase::Ready);
+    state.build_progress.lock().unwrap().remove(&drive);
+    tracing::info!(
+        "volume {drive}: indexed {files} entries in {:.2}s",
+        elapsed.as_secs_f32()
+    );
+    Ok(pos)
+}
+
+fn vol_err(e: FsError) -> VolErr {
+    match e {
+        FsError::JournalGone | FsError::NotReady => VolErr::Rebuild,
+        _ => VolErr::Retry(2000),
+    }
+}
+
+fn watch_loop(
+    state: &Arc<AppState>,
+    vol: &VolumeHandle,
+    drive: char,
+    mut pos: JournalPos,
+) -> Result<(), VolErr> {
+    let poll = Duration::from_millis(state.config.poll_ms.max(20));
+    loop {
+        if state.stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        std::thread::sleep(poll);
+        if state.engine.take_rebuild_flag(drive) {
+            return Err(VolErr::Rebuild);
+        }
+        match vol.read_journal(pos, 500_000) {
+            Ok((events, next)) => {
+                pos = next;
+                if !events.is_empty() {
+                    state.engine.apply(drive, &events);
+                }
+            }
+            Err(FsError::JournalGone) | Err(FsError::NotReady) => {
+                tracing::warn!("volume {drive}: journal unavailable — rebuilding");
+                return Err(VolErr::Rebuild);
+            }
+            Err(e) => {
+                tracing::warn!("volume {drive}: journal read: {e}");
+            }
+        }
+    }
+}
+
+fn fail_volume(state: &Arc<AppState>, drive: char) {
+    state
+        .engine
+        .init_volume(drive, VolumeIndex::new(drive), None, VolumePhase::Failed);
+    state.build_progress.lock().unwrap().remove(&drive);
+}

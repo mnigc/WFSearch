@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # fmt + clippy + test + release build, in the order a reviewer cares about:
+  # cheap style gates fail before the slow link.
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: rustfmt
+        run: cargo fmt --all --check
+
+      - name: clippy (warnings are errors)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # The pipe/HTTP end-to-end tests bind real OS resources (unique pipe name
+      # + port 0), so they need no elevation beyond what the runner already has.
+      - name: test
+        run: cargo test --workspace
+
+      - name: build (release)
+        run: cargo build --workspace --release
+
+  # Manual only: criterion runs take minutes, which is too slow for every push.
+  bench:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `--bench scan` keeps the lib test harness out of the run (criterion
+      # rejects flags it does not know, and it would otherwise receive them).
+      - name: benchmark the 1M-entry scan
+        run: cargo bench -p wfs-core --bench scan
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: criterion
+          path: target/criterion

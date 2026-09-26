@@ -1,0 +1,21 @@
+[package]
+name = "wfs-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "In-memory NTFS filename index and query engine for WFSearch (pure logic, no IO)"
+
+[dependencies]
+serde = { workspace = true }
+memchr = { workspace = true }
+rayon = { workspace = true }
+ahash = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "scan"
+harness = false
