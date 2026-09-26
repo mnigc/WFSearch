@@ -8,12 +8,11 @@
 pub mod records;
 pub mod sec;
 
-use records::{events_from_records, rd_u16, rd_u32, rd_u64, RawRecord};
+use records::{rd_u16, rd_u32, rd_u64, scan_records, RawRecord, RecordScan};
 use std::cell::Cell;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStrExt;
 use std::ptr::{null, null_mut};
-use wfs_core::IndexEvent;
 use wfs_core::JournalPos;
 
 // FSCTL control codes: CTL_CODE(FILE_DEVICE_FILE_SYSTEM = 0x0009, function,
@@ -368,27 +367,30 @@ impl VolumeHandle {
         }
     }
 
-    /// Read pending journal records starting at `pos`. Returns the applied
-    /// events and the updated position. Never returns partial buffers: the
-    /// whole output buffer is consumed before advancing `next_usn`.
+    /// Read pending journal records starting at `pos`. Returns the parsed
+    /// events, how many raw records the reply carried (so a caller can tell
+    /// "nothing happened" from "records we cannot read"), and the updated
+    /// position. Never returns partial buffers: the whole output buffer is
+    /// consumed before advancing `next_usn`.
     pub fn read_journal(
         &self,
         pos: JournalPos,
         max_events: usize,
-    ) -> Result<(Vec<IndexEvent>, JournalPos), FsError> {
+    ) -> Result<(RecordScan, JournalPos), FsError> {
         const BUF: usize = 1 << 20; // 1MB per read
         let mut out = vec![0u8; BUF];
-        let mut events = Vec::new();
+        let mut scan = RecordScan::default();
         let mut cur = pos;
-        // READ_USN_JOURNAL_DATA_V0 is 40 bytes; V1 appends MinMajorVersion /
-        // MaxMajorVersion to ask for USN_RECORD_V2 explicitly (V1 records carry
-        // 128-bit file ids that this parser does not handle). Same V0 → V1
-        // fallback as the enumeration.
+        // READ_USN_JOURNAL_DATA_V1 is 48 bytes and pins the record version we
+        // can parse (Min = Max = USN_RECORD_V2); V0 is 40 bytes and leaves the
+        // version to the driver. Ask for V2 first — a driver that answers a V0
+        // request with V3 records makes every event unreadable — and fall back
+        // to V0 for drivers that reject the longer struct.
         let mut inb = [0u8; 48];
         inb[8..12].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // all reasons
         inb[40..42].copy_from_slice(&2u16.to_le_bytes()); // MinMajorVersion
         inb[42..44].copy_from_slice(&2u16.to_le_bytes()); // MaxMajorVersion
-        let mut len = 40usize;
+        let mut len = 48usize;
         loop {
             inb[0..8].copy_from_slice(&(cur.next_usn as i64).to_le_bytes());
             // Timeout (16..24) and BytesToWaitFor (24..32) stay zero: return
@@ -398,24 +400,28 @@ impl VolumeHandle {
             let returned = match self.dio(FSCTL_READ_USN_JOURNAL, Some(&inb[..len]), Some(&mut out))
             {
                 Ok(n) => n,
+                // Nothing pending: the position is unchanged, so the caller
+                // simply polls again. Reporting this as an error turns an idle
+                // volume into a warning flood that buries real ones.
+                Err(ERROR_HANDLE_EOF) => return Ok((scan, cur)),
                 Err(e)
-                    if len == 40
+                    if len == 48
                         && (e == ERROR_INVALID_PARAMETER || e == ERROR_INVALID_USER_BUFFER) =>
                 {
-                    len = 48;
+                    len = 40; // driver only knows the V0 struct
                     continue;
                 }
                 Err(e) => return Err(win_err(e)),
             };
             if returned < 8 {
-                return Ok((events, cur));
+                return Ok((scan, cur));
             }
             cur.next_usn = rd_u64(&out, 0);
-            events.extend(events_from_records(&out[8..returned]));
-            if returned > 8 && events.len() < max_events {
+            scan.merge(scan_records(&out[8..returned]));
+            if returned > 8 && scan.events.len() < max_events {
                 continue; // more records may be pending
             }
-            return Ok((events, cur));
+            return Ok((scan, cur));
         }
     }
 }

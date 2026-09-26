@@ -173,6 +173,10 @@ fn watch_loop(
     mut pos: JournalPos,
 ) -> Result<(), VolErr> {
     let poll = Duration::from_millis(state.config.poll_ms.max(20));
+    let mut warned_versions = false;
+    let mut polls: u64 = 0;
+    let mut records_seen: u64 = 0;
+    let mut heartbeat = Instant::now() + Duration::from_secs(15);
     loop {
         if state.stop.load(Ordering::Relaxed) {
             return Ok(());
@@ -182,10 +186,41 @@ fn watch_loop(
             return Err(VolErr::Rebuild);
         }
         match vol.read_journal(pos, 500_000) {
-            Ok((events, next)) => {
+            Ok((scan, next)) => {
                 pos = next;
-                if !events.is_empty() {
-                    state.engine.apply(drive, &events);
+                polls += 1;
+                records_seen += scan.records as u64;
+                if scan.records > 0 {
+                    // The numbers that matter when a change "does not show up":
+                    // records the driver handed over vs events the index got.
+                    tracing::debug!(
+                        "volume {drive}: journal +{} records -> {} events ({} unparsable)",
+                        scan.records,
+                        scan.events.len(),
+                        scan.other_versions
+                    );
+                }
+                // A watch loop that polls and reads nothing is indistinguishable
+                // from an idle volume without this line.
+                if Instant::now() >= heartbeat {
+                    heartbeat = Instant::now() + Duration::from_secs(15);
+                    tracing::debug!(
+                        "volume {drive}: journal at usn {} - {polls} poll(s), {records_seen} \
+                         record(s) read so far",
+                        pos.next_usn
+                    );
+                }
+                if scan.other_versions > 0 && !warned_versions {
+                    warned_versions = true;
+                    tracing::warn!(
+                        "volume {drive}: {} journal records are not USN_RECORD_V2 ({} total read) \
+                         - those changes cannot be indexed",
+                        scan.other_versions,
+                        scan.records
+                    );
+                }
+                if !scan.events.is_empty() {
+                    state.engine.apply(drive, &scan.events);
                 }
             }
             Err(FsError::JournalGone) | Err(FsError::NotReady) => {

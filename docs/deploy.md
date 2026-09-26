@@ -47,7 +47,9 @@ powershell -ExecutionPolicy Bypass -File scripts\acceptance.ps1
 
 脚本只写 `%TEMP%` 下的临时数据目录并起一个 console 模式进程,**不安装服务、不碰 `%ProgramData%`**;
 流程是:卷自检(`doctor`)→ 冷启动(全量 MFT 构建)→ 200 轮 × 3 种查询延迟 → `%TEMP%` 建/删文件的可见延迟 →
-`quit` 落盘后重启测暖启动。输出为纯 ASCII,可直接贴出;某一步失败时会附上引擎自己的日志与 `doctor` 结果。
+`quit` 落盘后重启测暖启动。输出为纯 ASCII,可直接贴出;第一步带上 `doctor` 结果,之后任何一步失败都会
+先停引擎、再把引擎日志里 `volume/ERROR/WARN/journal/panic` 命中的行打印出来(引擎以
+`RUST_LOG=info,wfs_server=debug,wfs_fs=debug` 启动,所以日志里也有 journal 的 records→events 计数)。
 
 ## 卷自检(doctor)
 
@@ -63,13 +65,20 @@ volume C:
   FSCTL_QUERY_USN_JOURNAL: ok - id 0x1d95f206cae361d, next_usn 49521681376, lowest_valid 0, max 64 MB, record versions (2, 4)
   ensure USN journal      : ok - id 0x1d95f206cae361d
   FSCTL_ENUM_USN_DATA     : ok - 1433097 records (24-byte input, first entry "System Volume Information")
-  FSCTL_READ_USN_JOURNAL  : ok - 0 pending events, next_usn 49521681376
+  FSCTL_READ_USN_JOURNAL  : ok - 0 pending record(s), 0 event(s), 0 unparsable, next_usn 49521681376
+  journal history         : usn 49521681376..49521681376 - 0 record(s), 0 event(s), 0 unparsable [0 create, 0 delete, 0 rename]
 ```
 
 任一行失败即打印 `FAILED - <原因>` 并以 exit code 1 结束(便于脚本判断)。`open` 失败且原因是
 `access denied` 时说明当前进程没提升;`32-byte input` 表示内核只接受带版本号的
 `MFT_ENUM_DATA_V1`(新版本 Windows 可能如此,引擎会自动切换);`0 records` 说明枚举被内核
 当场判定为空(历史上是 `HighUsn` 写成了 `u64::MAX`,即有符号 USN 域里的 -1)。
+
+最后两行是"新文件搜不到"的定位依据,注意区分 `record(s)` 与 `event(s)`:
+`journal history` 从卷上最早的记录重放一遍(NTFS 的 journal 只保留最近一段,这里通常是几十万条),
+`records > 0` 但 `events == 0` 表示内核交出的记录不是 `USN_RECORD_V2`(索引器读不了,日志里会
+有一条对应的 `not USN_RECORD_V2` 警告);`records == 0` 表示这卷的 journal 里确实没有可重放的记录。
+这两行只用于排查,不影响退出码。
 
 ## 数据与配置
 
@@ -100,7 +109,7 @@ wfs-cli.exe status
 | 现象 | 原因与处理 |
 |---|---|
 | `status` 里 volume `failed` | 先跑 `wfs-server.exe doctor <盘>`:它逐步报出是哪个 ioctl 失败、Win32 错误码是什么。原因通常是 console 模式没提权、盘不存在、或卷上 USN journal 不可用 |
-| 新文件搜不到 | 查询在 1s 内属正常窗口;持续查不到则看 journal 是否回绕(会自动重建) |
+| 新文件搜不到 | 查询在 1s 内属正常窗口;若一直搜不到,先跑 `doctor`(看上一节的 `journal history`),再以 `RUST_LOG=info,wfs_server=debug,wfs_fs=debug` 起引擎:watch 循环每 15s 打一行 `journal at usn <n> - <polls> poll(s), <records> record(s) read so far`,有变化时打 `journal +N records -> M events`。位置不动或 `records > 0, events == 0` 即可判定是 journal 读取还是解析的问题 |
 | pipe 连接拒绝 | 服务未启动、`pipe_name` 配置不一致,或配置了 `pipe_acl = "restricted"` 而客户端非管理员 |
 | pipe 启动即退出 | 同名的 pipe 已被占用(已有实例在跑):`--config` 换 `pipe_name`,或先停掉旧进程 |
 | HTTP 端口冲突 | 改 `http_port`;仅监听 127.0.0.1,不对局域网暴露 |

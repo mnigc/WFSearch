@@ -138,24 +138,48 @@ impl<'a> RawRecord<'a> {
     }
 }
 
+/// What one USN read/enum buffer body contained.
+#[derive(Debug, Default)]
+pub struct RecordScan {
+    pub events: Vec<IndexEvent>,
+    /// raw records in the buffer (every version)
+    pub records: usize,
+    /// records that are not USN_RECORD_V2. The parser cannot read them, and
+    /// dropping them silently is indistinguishable from an idle journal — so
+    /// they are counted, and callers can report a volume whose events are
+    /// being missed.
+    pub other_versions: usize,
+}
+
+impl RecordScan {
+    pub fn merge(&mut self, other: RecordScan) {
+        self.events.extend(other.events);
+        self.records += other.records;
+        self.other_versions += other.other_versions;
+    }
+}
+
 /// Parse a whole USN read/enum buffer body (records packed back to back).
 /// For journal reads, the caller skips the leading 8-byte NextUsn field.
-pub fn events_from_records(data: &[u8]) -> Vec<IndexEvent> {
-    let mut events = Vec::new();
+pub fn scan_records(data: &[u8]) -> RecordScan {
+    let mut scan = RecordScan::default();
     let mut off = 0usize;
     while off + 8 <= data.len() {
         let reclen = rd_u32(data, off) as usize;
         if reclen == 0 || off + reclen > data.len() {
             break;
         }
-        if let Some(rec) = RawRecord::parse(&data[off..off + reclen]) {
+        scan.records += 1;
+        if rd_u16(data, off + 4) != 2 {
+            scan.other_versions += 1;
+        } else if let Some(rec) = RawRecord::parse(&data[off..off + reclen]) {
             if let Some(ev) = rec.to_event() {
-                events.push(ev);
+                scan.events.push(ev);
             }
         }
         off += reclen;
     }
-    events
+    scan
 }
 
 // -------------------------------------------------------------------- tests
@@ -246,10 +270,25 @@ mod tests {
     fn multi_record_buffer() {
         let mut buf = make_record(100, 5, USN_REASON_FILE_CREATE, 0, "a.txt");
         buf.extend_from_slice(&make_record(101, 5, USN_REASON_RENAME_NEW_NAME, 0, "b.txt"));
-        let events = events_from_records(&buf);
-        assert_eq!(events.len(), 2);
-        assert!(matches!(events[0], IndexEvent::Create { .. }));
-        assert!(matches!(events[1], IndexEvent::RenameNew { .. }));
+        let scan = scan_records(&buf);
+        assert_eq!(scan.records, 2);
+        assert_eq!(scan.other_versions, 0);
+        assert_eq!(scan.events.len(), 2);
+        assert!(matches!(scan.events[0], IndexEvent::Create { .. }));
+        assert!(matches!(scan.events[1], IndexEvent::RenameNew { .. }));
+    }
+
+    #[test]
+    fn non_v2_records_are_counted_not_dropped_silently() {
+        // A driver that answers with USN_RECORD_V3 must be visible: the parser
+        // cannot read 128-bit file ids, and "0 events" alone cannot tell that
+        // apart from a quiet volume.
+        let mut buf = make_record(100, 5, USN_REASON_FILE_CREATE, 0, "a.txt");
+        buf[4..6].copy_from_slice(&3u16.to_le_bytes()); // MajorVersion = 3
+        let scan = scan_records(&buf);
+        assert_eq!(scan.records, 1);
+        assert_eq!(scan.other_versions, 1);
+        assert!(scan.events.is_empty());
     }
 
     #[test]
@@ -258,8 +297,9 @@ mod tests {
         // instead of panicking or emitting garbage events
         let mut buf = make_record(100, 5, USN_REASON_FILE_CREATE, 0, "a.txt");
         buf.extend_from_slice(&[0xEE; 5]);
-        let events = events_from_records(&buf);
-        assert_eq!(events.len(), 1);
+        let scan = scan_records(&buf);
+        assert_eq!(scan.records, 1);
+        assert_eq!(scan.events.len(), 1);
     }
 
     #[test]

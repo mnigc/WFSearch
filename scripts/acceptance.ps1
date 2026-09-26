@@ -51,6 +51,14 @@ if ($LASTEXITCODE -ne 0) { throw "cargo build failed ($LASTEXITCODE)" }
 $exe = Join-Path $repoRoot 'target\release\wfs-server.exe'
 if (-not (Test-Path $exe)) { throw "missing $exe" }
 
+# An engine left running holds its volume handle and the HTTP port, so Ctrl-C
+# or an unexpected throw must not leave one behind.
+$script:liveEngine = [hashtable]::Synchronized(@{ Proc = $null })
+Register-EngineEvent -SourceIdentifier PowerShell.Exiting -SupportEvent -MessageData $script:liveEngine -Action {
+    $p = $event.MessageData.Proc
+    if ($null -ne $p -and -not $p.HasExited) { $p.Kill() }
+}
+
 # --------------------------------------------------------------------- helpers
 
 function Get-FreePort {
@@ -89,6 +97,9 @@ function Start-Engine {
     $psi.FileName = $exe
     $psi.Arguments = "--config `"$ConfigPath`" console"
     $psi.UseShellExecute = $false
+    # debug logs: the journal records->events counters are what tells a quiet
+    # volume apart from changes that never reach the index.
+    $psi.EnvironmentVariables['RUST_LOG'] = 'info,wfs_server=debug,wfs_fs=debug'
     # stdin stays open on purpose: the console REPL exits on EOF.
     $psi.RedirectStandardInput = $true
     # stdout/stderr are captured (not shown live) so a failure report carries
@@ -97,6 +108,7 @@ function Start-Engine {
     $psi.RedirectStandardError = $true
     $p = [System.Diagnostics.Process]::Start($psi)
     if ($p.HasExited) { throw "engine exited immediately (code $($p.ExitCode))" }
+    $script:liveEngine.Proc = $p
     $script:engineOut = $p.StandardOutput.ReadToEndAsync()
     $script:engineErr = $p.StandardError.ReadToEndAsync()
     return $p
@@ -105,13 +117,16 @@ function Start-Engine {
 function Stop-Engine {
     param($Process)
     if ($null -eq $Process) { return }
+    $script:liveEngine.Proc = $null
+    $graceful = $true
     if (-not $Process.HasExited) {
         $Process.StandardInput.WriteLine('quit')
         $Process.StandardInput.Flush()
-        if (-not $Process.WaitForExit(60000)) { $Process.Kill(); throw 'engine did not exit on quit' }
+        if (-not $Process.WaitForExit(60000)) { $Process.Kill(); $graceful = $false }
     }
     # drain the readers; both complete once the process is gone
     $script:engineLog = (Get-TaskText $script:engineOut) + (Get-TaskText $script:engineErr)
+    if (-not $graceful) { throw 'engine did not exit on quit' }
 }
 
 function Get-TaskText {
@@ -124,9 +139,34 @@ function Get-TaskText {
 function Format-EngineLog {
     param([string]$Log)
     if ([string]::IsNullOrWhiteSpace($Log)) { return '(engine produced no output)' }
-    $lines = @($Log -split "`r?`n" | Where-Object { $_ -match 'volume |ERROR|WARN|indexed|snapshot' } | Select-Object -First 40)
+    $lines = @($Log -split "`r?`n" | Where-Object { $_ -match 'volume |ERROR|WARN|indexed|snapshot|journal|panic' } | Select-Object -First 40)
     if ($lines.Count -eq 0) { return '(engine produced no volume output)' }
     return ($lines -join "`n    ")
+}
+
+# Stop the engine (which drains its log) and print the interesting lines. Any
+# step that fails while the engine runs must call this first: otherwise the
+# failure report carries no engine-side evidence at all.
+function Stop-And-Report {
+    param($Process, [string]$Title)
+    try { Stop-Engine -Process $Process } catch { Write-Host ("      (engine stop: {0})" -f $_.Exception.Message) }
+    Write-Host ''
+    Write-Host ("--- engine log ({0}) ---" -f $Title)
+    Write-Host ('    ' + (Format-EngineLog $script:engineLog))
+    Write-Host ''
+}
+
+# One-line /api/v1/status digest for failure messages.
+function Format-Status {
+    param([int]$Port)
+    try {
+        $s = Get-Http -Port $Port -Path '/api/v1/status' | ConvertFrom-Json
+        $v = @($s.volumes)[0]
+        return ("volume {0}: phase={1}, files={2:N0}, deleted={3:N0}, journal={4}, last update {5} ms ago" -f `
+                $v.drive, $v.phase, $v.files, $v.deleted, $v.journal, $v.last_update_ms_ago)
+    } catch {
+        return ("status unavailable: {0}" -f $_.Exception.Message)
+    }
 }
 
 function Wait-Status {
@@ -211,10 +251,7 @@ $sw = [System.Diagnostics.Stopwatch]::StartNew()
 try {
     $status = Wait-Status -Port $port -TimeoutSec $ColdTimeoutSec -Process $proc
 } catch {
-    Stop-Engine -Process $proc
-    Write-Host ''
-    Write-Host '--- engine log (cold start) ---'
-    Write-Host ('    ' + (Format-EngineLog $script:engineLog))
+    Stop-And-Report -Process $proc -Title 'cold start'
     throw
 } finally {
     $sw.Stop()
@@ -238,30 +275,48 @@ if ($probeDir.Substring(0, 2).ToUpper() -ne 'C:') { $probeDir = Join-Path $env:w
 $probe = Join-Path $probeDir ($stem + '.txt')
 $pattern = [uri]::EscapeDataString($stem + '*')
 Write-Host ("      probe file: {0}" -f $probe)
+Write-Host ("      index before: {0}" -f (Format-Status -Port $port))
 
 Set-Content -Path $probe -Value 'wfs'
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 $seen = $false
-while ($sw.Elapsed.TotalSeconds -lt 10) {
-    $r = Get-Http -Port $port -Path "/api/v1/search?q=$pattern&limit=5" | ConvertFrom-Json
-    if ($r.total_matched -ge 1) { $seen = $true; break }
-    Start-Sleep -Milliseconds 50
-}
-$sw.Stop()
-if (-not $seen) { throw "created file never showed up in the index (probe: $probe)" }
-$createMs = $sw.Elapsed.TotalMilliseconds
+try {
+    # Positive control: if even "*" matches nothing, the step below is really
+    # "the search endpoint is broken", not "the change never arrived".
+    $ctl = Get-Http -Port $port -Path "/api/v1/search?q=$([uri]::EscapeDataString('*'))&limit=1" | ConvertFrom-Json
+    if ($null -eq $ctl.total_matched) { throw "search did not answer with total_matched: $ctl" }
+    Write-Host ("      control query '*': {0:N0} match(es)" -f $ctl.total_matched)
 
-Remove-Item -Path $probe -Force
-$sw = [System.Diagnostics.Stopwatch]::StartNew()
-$gone = $false
-while ($sw.Elapsed.TotalSeconds -lt 10) {
-    $r = Get-Http -Port $port -Path "/api/v1/search?q=$pattern&limit=5" | ConvertFrom-Json
-    if ($r.total_matched -eq 0) { $gone = $true; break }
-    Start-Sleep -Milliseconds 50
+    while ($sw.Elapsed.TotalSeconds -lt 10) {
+        $r = Get-Http -Port $port -Path "/api/v1/search?q=$pattern&limit=5" | ConvertFrom-Json
+        if ($r.total_matched -ge 1) { $seen = $true; break }
+        Start-Sleep -Milliseconds 50
+    }
+    $sw.Stop()
+    $createMs = $sw.Elapsed.TotalMilliseconds
+    if (-not $seen) {
+        throw ("created file never showed up in the index within 10 s (probe: {0})`n      {1}" -f `
+                $probe, (Format-Status -Port $port))
+    }
+
+    Remove-Item -Path $probe -Force
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $gone = $false
+    while ($sw.Elapsed.TotalSeconds -lt 10) {
+        $r = Get-Http -Port $port -Path "/api/v1/search?q=$pattern&limit=5" | ConvertFrom-Json
+        if ($r.total_matched -eq 0) { $gone = $true; break }
+        Start-Sleep -Milliseconds 50
+    }
+    $sw.Stop()
+    $deleteMs = $sw.Elapsed.TotalMilliseconds
+    if (-not $gone) {
+        throw ("deleted file stayed in the index for 10 s (probe: {0})`n      {1}" -f `
+                $probe, (Format-Status -Port $port))
+    }
+} catch {
+    Stop-And-Report -Process $proc -Title 'change visibility'
+    throw
 }
-$sw.Stop()
-if (-not $gone) { throw 'deleted file stayed in the index' }
-$deleteMs = $sw.Elapsed.TotalMilliseconds
 
 # --- 4. warm start ------------------------------------------------------------
 Write-Host '[6/7] warm start (snapshot resume) ...'
@@ -275,10 +330,7 @@ $sw = [System.Diagnostics.Stopwatch]::StartNew()
 try {
     $warm = Wait-Status -Port $port -TimeoutSec 120 -Process $proc
 } catch {
-    Stop-Engine -Process $proc
-    Write-Host ''
-    Write-Host '--- engine log (warm start) ---'
-    Write-Host ('    ' + (Format-EngineLog $script:engineLog))
+    Stop-And-Report -Process $proc -Title 'warm start'
     throw
 } finally {
     $sw.Stop()

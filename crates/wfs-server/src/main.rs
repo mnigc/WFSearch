@@ -162,9 +162,12 @@ fn doctor(config: &Config, drives: Vec<String>) -> anyhow::Result<()> {
                 next_usn: j.next_usn as u64,
             };
             match vol.read_journal(pos, 1000) {
-                Ok((ev, next)) => println!(
-                    "  FSCTL_READ_USN_JOURNAL  : ok - {} pending events, next_usn {}",
-                    ev.len(),
+                Ok((scan, next)) => println!(
+                    "  FSCTL_READ_USN_JOURNAL  : ok - {} pending record(s), {} event(s), \
+                     {} unparsable, next_usn {}",
+                    scan.records,
+                    scan.events.len(),
+                    scan.other_versions,
                     next.next_usn
                 ),
                 Err(e) => {
@@ -172,12 +175,50 @@ fn doctor(config: &Config, drives: Vec<String>) -> anyhow::Result<()> {
                     failed = true;
                 }
             }
+            // Replay from the oldest record the journal still holds. A watch
+            // loop that sees no events is only diagnosable with the raw record
+            // count next to the event count: "0 == 0" is an idle journal, while
+            // "records > 0, events == 0" means the records are not V2. Purely
+            // informative — it never affects the exit code.
+            let oldest = wfs_core::JournalPos {
+                journal_id: j.journal_id,
+                next_usn: j.first_usn.max(j.lowest_valid_usn).max(0) as u64,
+            };
+            match vol.read_journal(oldest, 200_000) {
+                Ok((scan, next)) => println!(
+                    "  journal history         : usn {}..{} - {} record(s), {} event(s), {} \
+                     unparsable [{}]",
+                    oldest.next_usn,
+                    next.next_usn,
+                    scan.records,
+                    scan.events.len(),
+                    scan.other_versions,
+                    event_breakdown(&scan.events)
+                ),
+                Err(e) => println!("  journal history         : (not replayable - {e})"),
+            }
         }
     }
     if failed {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// `create` / `delete` / `rename` counts of a journal replay, so an idle
+/// journal can be told apart from a volume whose changes never arrive.
+fn event_breakdown(events: &[wfs_core::IndexEvent]) -> String {
+    let (mut creates, mut deletes, mut renames) = (0u64, 0u64, 0u64);
+    for e in events {
+        match e {
+            wfs_core::IndexEvent::Create { .. } => creates += 1,
+            wfs_core::IndexEvent::Delete { .. } => deletes += 1,
+            wfs_core::IndexEvent::RenameOld { .. } | wfs_core::IndexEvent::RenameNew { .. } => {
+                renames += 1;
+            }
+        }
+    }
+    format!("{creates} create, {deletes} delete, {renames} rename")
 }
 
 /// stderr in console mode; a service has no console to write to, so it appends
