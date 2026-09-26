@@ -246,10 +246,6 @@ impl VolumeHandle {
         })
     }
 
-    pub fn drive(&self) -> char {
-        self.drive
-    }
-
     /// `MFT_ENUM_DATA` input length in use, or 0 when no enumeration has run
     /// yet.
     pub fn enum_input_len(&self) -> u32 {
@@ -566,6 +562,21 @@ mod tests {
                 (101, 100, "work".to_string(), true)
             ]
         );
+    }
+
+    #[test]
+    fn sequence_bits_do_not_confuse_the_walk() {
+        // File references arrive as (seq << 48) | record; metafile filtering
+        // and parent anchoring must see plain record numbers.
+        let seq = 0x0007_0000_0000_0000u64;
+        let mut buf = 99u64.to_le_bytes().to_vec();
+        buf.extend(record(seq | 9, seq | 5, "$Secure", 0)); // metafile: filtered
+        buf.extend(record(seq | 100, seq | 5, "root-child.txt", 0));
+        let mut seen = Vec::new();
+        walk_enum_batch(&buf, buf.len(), |e| {
+            seen.push((e.frn, e.parent_frn, e.name, e.is_dir));
+        });
+        assert_eq!(seen, vec![(100, 5, "root-child.txt".to_string(), false)]);
     }
 
     #[test]

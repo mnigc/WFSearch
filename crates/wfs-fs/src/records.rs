@@ -6,8 +6,8 @@
 //!  0  RecordLength        u32
 //!  4  MajorVersion        u16   (=2)
 //!  6  MinorVersion        u16
-//!  8  FileReferenceNumber u64
-//! 16  ParentFileReferenceNumber u64
+//!  8  FileReferenceNumber u64   (48-bit MFT index + 16-bit sequence)
+//! 16  ParentFileReferenceNumber u64 (same layout)
 //! 24  Usn                 i64
 //! 32  TimeStamp           i64
 //! 40  Reason              u32
@@ -30,6 +30,15 @@ pub const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
 /// Records with FRN below this are NTFS metafiles ($MFT, $LogFile, …) and are
 /// never indexed. User files cannot live in the first 24 MFT records.
 pub const MFT_METAFILE_MAX_FRN: u64 = 24;
+
+/// NTFS file references carry the MFT record's 16-bit sequence number in the
+/// high word: `(sequence << 48) | record` (MS-FSA, FileId layout). Parents are
+/// referenced with the parent's *current* sequence, so raw values never match
+/// plain record numbers — a file directly in the root reports
+/// `(seq << 48) | 5`, not `5`. Comparing them unmasked misses every lookup and
+/// orphans a full build down to the root alone, so the sequence bits are
+/// stripped the moment a record is parsed.
+pub const FRN_RECORD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
 #[inline]
 pub fn rd_u16(b: &[u8], off: usize) -> u16 {
@@ -84,8 +93,8 @@ impl<'a> RawRecord<'a> {
             return None;
         }
         Some(RawRecord {
-            frn: rd_u64(rec, 8),
-            parent_frn: rd_u64(rec, 16),
+            frn: rd_u64(rec, 8) & FRN_RECORD_MASK,
+            parent_frn: rd_u64(rec, 16) & FRN_RECORD_MASK,
             reason: rd_u32(rec, 40),
             attrs: rd_u32(rec, 52),
             name: &rec[noff..noff + nlen],
@@ -314,6 +323,26 @@ mod tests {
             RawRecord::parse(&ro).unwrap().to_event(),
             Some(IndexEvent::RenameOld { frn: 77 })
         ));
+    }
+
+    #[test]
+    fn file_references_strip_the_sequence_number() {
+        // Real volumes reference parents as (parent_seq << 48) | parent_record;
+        // the sequence must not leak into index keys or a root-anchored
+        // lookup misses and orphans the whole build.
+        let seq = 0x0005_0000_0000_0000u64;
+        let buf = make_record(seq | 100, seq | 5, USN_REASON_FILE_CREATE, 0, "in-root.txt");
+        let rec = RawRecord::parse(&buf).unwrap();
+        assert_eq!(rec.frn, 100);
+        assert_eq!(rec.parent_frn, 5); // anchors at ROOT_FRN
+        match rec.to_event().unwrap() {
+            IndexEvent::Create {
+                frn, parent_frn, ..
+            } => {
+                assert_eq!((frn, parent_frn), (100, 5));
+            }
+            _ => panic!("expected create"),
+        }
     }
 
     #[test]

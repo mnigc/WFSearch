@@ -12,7 +12,10 @@ use wfs_fs::{resume_position, VolumeHandle};
 use crate::state::AppState;
 
 const MAGIC: [u8; 4] = *b"WFS1";
-const FORMAT_VERSION: u32 = 1;
+// v2: file references are normalized to 48-bit record numbers at parse time;
+// v1 snapshots hold raw references with sequence bits, which journal replay
+// no longer matches — reject them so affected volumes rebuild once.
+const FORMAT_VERSION: u32 = 2;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct VolumeSnap {
