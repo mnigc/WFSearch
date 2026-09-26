@@ -1,3 +1,5 @@
+[中文](deploy.md) | [English](deploy.en.md)
+
 # WFSearch 部署指南
 
 ## 构建

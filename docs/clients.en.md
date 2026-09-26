@@ -1,10 +1,11 @@
 [中文](clients.md) | [English](clients.en.md)
 
-# 应用接入示例
+# Client Integration Examples
 
-所有通道的载荷都是 JSON(见 [protocol.md](protocol.md))。优先用 Named Pipe(延迟最低);Web/脚本场景用 HTTP。
+Every transport carries JSON payloads (see [protocol.en.md](protocol.en.md)). Prefer the
+Named Pipe (lowest latency); use HTTP for web/script scenarios.
 
-## Python — Named Pipe(可运行)
+## Python — Named Pipe (runnable)
 
 ```python
 import json
@@ -76,7 +77,7 @@ static async Task<JsonElement> CallPipeAsync(object req)
     return JsonDocument.Parse(resp).RootElement;
 }
 
-// 用法:
+// Usage:
 var resp = await CallPipeAsync(new {
     op = "search",
     args = new { q = "*.docx", limit = 20, offset = 0, sort = "none" }
@@ -92,27 +93,36 @@ var resp = await JsonSerializer.DeserializeAsync<JsonElement>(
     await new HttpClient().GetStreamAsync(url));
 ```
 
-## Rust(wfs-client crate)
+## Rust (wfs-client crate)
 
 ```rust
 use wfs_client::Client;
 use wfs_proto::SearchReq;
 
 let mut c = Client::connect_default().unwrap();
-let r = c.search(&SearchReq { q: "报告".into(), ..Default::default() }).unwrap();
+let r = c.search(&SearchReq { q: "report".into(), ..Default::default() }).unwrap();
 for f in &r.results { println!("{}", f.path); }
 
-// 按路径匹配(把文件名匹配换成整条路径匹配;慢 5~10×)
+// Match on path (replaces filename matching with whole-path matching; 5–10× slower)
 let r = c.search(&SearchReq { q: r"projects\2026".into(), match_path: true, ..Default::default() }).unwrap();
 ```
 
-`SearchReq` 除 `q` 外都有默认值:`limit=100`、`offset=0`、`sort=SortKind::None`、`match_path=false`。
+Every `SearchReq` field except `q` has a default: `limit=100`, `offset=0`,
+`sort=SortKind::None`, `match_path=false`.
 
-## 接入要点
+## Integration notes
 
-1. **复用连接**:pipe 连接建立后可连续发多个请求(每请求一帧),避免反复连接。
-2. **分页**:`total_matched` 是全量命中数,用 `offset`/`limit` 取页;默认按索引序返回(最快)。
-3. **就绪判断**:服务启动即监听;客户端应先查 `status` 里对应卷 `phase == "ready"` 再展示"无结果",避免索引未完成时误判。
-4. **错误处理**:`{"type":"err","data":{"code":1|2|3,"message":...}}`,HTTP 侧对应 4xx/5xx。
-5. **路径匹配**:查询词里含 `\` 或 `/` 的词会自动按路径匹配;要按路径匹配**全部**词则设 `match_path=true`(Named Pipe)或 `match_path=true`(HTTP 查询参数)。只搜文件名时不要开,慢 5~10×。
-6. **权限**:服务端 `pipe_acl = "restricted"` 时,pipe 仅 SYSTEM + Administrators 可连;普通用户客户端会收到"拒绝访问",此时改用 HTTP(仅回环)或提升权限。
+1. **Reuse connections**: a pipe connection can carry many requests (one frame each) —
+   avoid reconnecting per call.
+2. **Paging**: `total_matched` is the full hit count; fetch pages with `offset`/`limit`.
+   Results default to index order (fastest).
+3. **Readiness**: the server listens as soon as it starts; clients should check
+   `status` for `phase == "ready"` on the relevant volume before concluding "no results",
+   so an unfinished index is not mistaken for an empty one.
+4. **Errors**: `{"type":"err","data":{"code":1|2|3,"message":...}}`; HTTP maps these to 4xx/5xx.
+5. **Path matching**: terms containing `\` or `/` match on the path automatically; to put
+   **all** terms on the path set `match_path=true` (Named Pipe) or `match_path=true` (HTTP
+   query parameter). Keep it off for filename-only searches — it costs 5–10×.
+6. **Permissions**: with `pipe_acl = "restricted"` on the server, the pipe accepts only
+   SYSTEM + Administrators; non-admin clients get "access denied" and should switch to
+   HTTP (loopback only) or elevate.

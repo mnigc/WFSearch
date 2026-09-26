@@ -1,3 +1,5 @@
+[中文](protocol.md) | [English](protocol.en.md)
+
 # WFSearch 线上协议 v1
 
 两种传输通道,载荷完全一致(JSON,UTF-8):
