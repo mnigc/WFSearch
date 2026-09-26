@@ -71,12 +71,12 @@ fn read_snapshot(state: &AppState) -> Option<SnapshotFile> {
     let snap: SnapshotFile = match bincode::deserialize(&bytes) {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!("snapshot unreadable ({e}) — full rebuild");
+            tracing::warn!("snapshot unreadable ({e}) - full rebuild");
             return None;
         }
     };
     if snap.magic != MAGIC || snap.version != FORMAT_VERSION {
-        tracing::warn!("snapshot version mismatch — full rebuild");
+        tracing::warn!("snapshot version mismatch - full rebuild");
         return None;
     }
     Some(snap)

@@ -46,8 +46,29 @@ powershell -ExecutionPolicy Bypass -File scripts\acceptance.ps1
 ```
 
 脚本只写 `%TEMP%` 下的临时数据目录并起一个 console 模式进程,**不安装服务、不碰 `%ProgramData%`**;
-流程是:冷启动(全量 MFT 构建)→ 200 轮 × 3 种查询延迟 → `%TEMP%` 建/删文件的可见延迟 →
-`quit` 落盘后重启测暖启动。输出为纯 ASCII,可直接贴出。
+流程是:卷自检(`doctor`)→ 冷启动(全量 MFT 构建)→ 200 轮 × 3 种查询延迟 → `%TEMP%` 建/删文件的可见延迟 →
+`quit` 落盘后重启测暖启动。输出为纯 ASCII,可直接贴出;某一步失败时会附上引擎自己的日志与 `doctor` 结果。
+
+## 卷自检(doctor)
+
+索引建不起来时,不要靠猜——`doctor` 把 `run_volume` 的每一步单独跑一遍并打印内核返回:
+
+```powershell
+wfs-server.exe doctor C
+```
+
+```
+volume C:
+  open \\.\C:            ok
+  FSCTL_GET_USN_JOURNAL   : ok - id 0x1d95f206cae361d, next_usn 49521681376, lowest_valid 0, max 64 MB, record versions (2, 4)
+  ensure USN journal      : ok - id 0x1d95f206cae361d
+  FSCTL_ENUM_USN_DATA     : ok - 1433097 records (accepted 24-byte input, first entry "System Volume Information")
+  FSCTL_READ_USN_JOURNAL  : ok - 0 pending events, next_usn 49521681376
+```
+
+任一行失败即打印 `FAILED - <原因>` 并以 exit code 1 结束(便于脚本判断)。`open` 失败且原因是
+`access denied` 时说明当前进程没提升;`accepted 32-byte input` 表示内核只接受带版本号的
+`MFT_ENUM_DATA_V1`(新版本 Windows 可能如此,引擎会自动切换)。
 
 ## 数据与配置
 
@@ -77,7 +98,7 @@ wfs-cli.exe status
 
 | 现象 | 原因与处理 |
 |---|---|
-| `status` 里 volume `failed` | console 模式未用管理员终端;服务模式下检查盘是否存在 |
+| `status` 里 volume `failed` | 先跑 `wfs-server.exe doctor <盘>`:它逐步报出是哪个 ioctl 失败、Win32 错误码是什么。原因通常是 console 模式没提权、盘不存在、或卷上 USN journal 不可用 |
 | 新文件搜不到 | 查询在 1s 内属正常窗口;持续查不到则看 journal 是否回绕(会自动重建) |
 | pipe 连接拒绝 | 服务未启动、`pipe_name` 配置不一致,或配置了 `pipe_acl = "restricted"` 而客户端非管理员 |
 | pipe 启动即退出 | 同名的 pipe 已被占用(已有实例在跑):`--config` 换 `pipe_name`,或先停掉旧进程 |

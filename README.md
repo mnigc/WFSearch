@@ -74,18 +74,25 @@ powershell -ExecutionPolicy Bypass -File scripts\acceptance.ps1
 REPL 命令:`直接输入查询词`、`status`、`quit`。查询语法:`report *.docx C:`(多词 AND、通配符、盘符过滤);
 词里含 `\` 或 `/` 时自动按路径匹配(`src\core`),也可用 `--match-path` 把全部词按路径匹配。
 
+卷起不来时先用 `doctor` 自检(管理员终端,逐步打印每个 ioctl 的结果,失败时 exit code 1):
+
+```powershell
+wfs-server.exe doctor C        # 打开卷 / 查 journal / 全量枚举 / 读 journal 四步逐条报结果
+wfs-server.exe doctor          # 不带盘符:探测配置里(或自动识别)的所有盘
+```
+
 ## 仓库结构
 
 ```
 crates/
 ├── wfs-proto/    协议类型(JSON serde),两种传输共用(6 个契约测试)
 ├── wfs-core/     内存索引 + 查询引擎(纯逻辑,20 个单测 + criterion 基准)
-├── wfs-fs/       MFT 枚举、USN Journal(手写 kernel32 FFI + 字节级记录解析,12 个单测)
+├── wfs-fs/       MFT 枚举、USN Journal(手写 kernel32 FFI + 字节级记录解析,14 个单测)
 ├── wfs-server/   服务二进制:console/service 模式、pipe+http、快照、SCM 生命周期
 │                 (11 个测试:含 pipe/HTTP 端到端、快照往返)
 └── wfs-client/   Rust SDK(参考实现)+ wfs-cli 调试工具(3 个测试:URL 编码 + CLI 参数回归)
 scripts/
-└── acceptance.ps1  真实磁盘验收(管理员跑一次,逐条对照目标 PASS/FAIL)
+└── acceptance.ps1  真实磁盘验收(管理员跑一次:doctor 自检 + 冷/热启动、延迟、可见性,逐条 PASS/FAIL)
 docs/
 ├── protocol.md   线上协议完整参考
 ├── deploy.md     部署/配置/服务管理

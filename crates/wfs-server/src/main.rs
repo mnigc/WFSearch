@@ -44,7 +44,7 @@ struct Cli {
     drives: Option<String>,
 }
 
-#[derive(Subcommand, Clone, Copy, Default)]
+#[derive(Subcommand, Clone, Default)]
 enum Command {
     /// run interactively in this console (default; needs elevation)
     #[default]
@@ -55,6 +55,12 @@ enum Command {
     Install,
     /// remove the Windows service (elevated)
     Uninstall,
+    /// probe volume access step by step and print every ioctl's result —
+    /// run this when a volume is reported as failed
+    Doctor {
+        /// drive letters to probe (default: the configured drives)
+        drives: Vec<String>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -79,7 +85,99 @@ fn main() -> anyhow::Result<()> {
         Command::Run => service::dispatch().map_err(|e| anyhow::anyhow!("service dispatch: {e}")),
         Command::Install => service::install(),
         Command::Uninstall => service::uninstall(),
+        Command::Doctor { drives } => doctor(&config, drives),
     }
+}
+
+/// Walk the volume access path of `run_volume` one ioctl at a time and print
+/// each result. Indexing failures otherwise only surface as a generic
+/// "volume marked failed" line in the log.
+fn doctor(config: &Config, drives: Vec<String>) -> anyhow::Result<()> {
+    let list: Vec<char> = if drives.is_empty() {
+        crate::app::resolve_drives(config)
+    } else {
+        let mut c = config.clone();
+        c.drives = drives;
+        crate::app::resolve_drives(&c)
+    };
+    if list.is_empty() {
+        println!("no drive to probe (pass one: wfs-server doctor C)");
+        return Ok(());
+    }
+    let mut failed = false;
+    for d in list {
+        println!("volume {d}:");
+        let vol = match wfs_fs::VolumeHandle::open(d) {
+            Ok(v) => v,
+            Err(e) => {
+                println!("  open \\\\.\\{d}:            FAILED - {e}");
+                println!("  (MFT and USN access need an elevated process: LocalSystem or an Administrator console)");
+                failed = true;
+                continue;
+            }
+        };
+        println!("  open \\\\.\\{d}:            ok");
+        match vol.journal_info() {
+            Ok(j) => println!(
+                "  FSCTL_GET_USN_JOURNAL   : ok - id {:#x}, next_usn {}, lowest_valid {}, max {} MB, record versions {:?}",
+                j.journal_id,
+                j.next_usn,
+                j.lowest_valid_usn,
+                j.maximum_size >> 20,
+                j.record_versions
+            ),
+            Err(e) => {
+                println!("  FSCTL_GET_USN_JOURNAL   : FAILED - {e}");
+                failed = true;
+            }
+        }
+        match vol.ensure_journal() {
+            Ok(j) => println!("  ensure USN journal      : ok - id {:#x}", j.journal_id),
+            Err(e) => {
+                println!("  ensure USN journal      : FAILED - {e}");
+                failed = true;
+            }
+        }
+        let mut records = 0u64;
+        let mut first = String::new();
+        match vol.enumerate_mft(|e| {
+            if records == 0 {
+                first = e.name;
+            }
+            records += 1;
+        }) {
+            Ok(()) => println!(
+                "  FSCTL_ENUM_USN_DATA     : ok - {records} records (accepted {}-byte input, first entry {:?})",
+                vol.enum_input_len(),
+                first
+            ),
+            Err(e) => {
+                println!("  FSCTL_ENUM_USN_DATA     : FAILED - {e}");
+                failed = true;
+            }
+        }
+        if let Ok(j) = vol.journal_info() {
+            let pos = wfs_core::JournalPos {
+                journal_id: j.journal_id,
+                next_usn: j.next_usn as u64,
+            };
+            match vol.read_journal(pos, 1000) {
+                Ok((ev, next)) => println!(
+                    "  FSCTL_READ_USN_JOURNAL  : ok - {} pending events, next_usn {}",
+                    ev.len(),
+                    next.next_usn
+                ),
+                Err(e) => {
+                    println!("  FSCTL_READ_USN_JOURNAL  : FAILED - {e}");
+                    failed = true;
+                }
+            }
+        }
+    }
+    if failed {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 /// stderr in console mode; a service has no console to write to, so it appends

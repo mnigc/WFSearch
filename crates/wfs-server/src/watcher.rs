@@ -30,6 +30,9 @@ enum VolErr {
     Retry(u64),
     /// journal gone/wrapped or volume changed — rebuild from scratch
     Rebuild,
+    /// cannot succeed by retrying (e.g. the token lacks volume access) — the
+    /// reason is reported and the volume is marked failed
+    Fatal(String),
 }
 
 fn volume_thread(state: Arc<AppState>, drive: char, resume: Option<JournalPos>) {
@@ -45,7 +48,9 @@ fn volume_thread(state: Arc<AppState>, drive: char, resume: Option<JournalPos>) 
                 retries += 1;
                 tracing::warn!("volume {drive}: retrying in {ms}ms (attempt {retries})");
                 if retries >= 10 {
-                    tracing::error!("volume {drive}: giving up; volume marked failed");
+                    tracing::error!(
+                        "volume {drive}: giving up after {retries} attempts; volume marked failed"
+                    );
                     fail_volume(&state, drive);
                     return;
                 }
@@ -54,6 +59,11 @@ fn volume_thread(state: Arc<AppState>, drive: char, resume: Option<JournalPos>) 
             Err(VolErr::Rebuild) => {
                 tracing::info!("volume {drive}: rebuilding index from MFT");
                 retries = 0;
+            }
+            Err(VolErr::Fatal(why)) => {
+                tracing::error!("volume {drive}: {why}; volume marked failed");
+                fail_volume(&state, drive);
+                return;
             }
         }
     }
@@ -64,7 +74,7 @@ fn run_volume(
     drive: char,
     resume: Option<JournalPos>,
 ) -> Result<(), VolErr> {
-    let vol = VolumeHandle::open(drive).map_err(|_| VolErr::Retry(2000))?;
+    let vol = VolumeHandle::open(drive).map_err(|e| vol_err(drive, e))?;
     let pos = match resume.and_then(|p| {
         vol.journal_info()
             .ok()
@@ -83,7 +93,7 @@ fn build_volume(
 ) -> Result<JournalPos, VolErr> {
     let started = Instant::now();
     state.build_progress.lock().unwrap().insert(drive, 0);
-    vol.ensure_journal().map_err(vol_err)?;
+    vol.ensure_journal().map_err(|e| vol_err(drive, e))?;
 
     let mut index = VolumeIndex::new(drive);
     let mut orphans: Vec<(u64, u64, String, bool)> = Vec::new();
@@ -99,7 +109,7 @@ fn build_volume(
             }
         }
     })
-    .map_err(vol_err)?;
+    .map_err(|e| vol_err(drive, e))?;
 
     // Parents can appear after children in MFT order — resolve iteratively.
     let mut dropped = 0usize;
@@ -123,7 +133,7 @@ fn build_volume(
 
     // Capture the journal position AFTER the enum: every change that happened
     // while scanning is covered by the journal from this point on.
-    let info = vol.journal_info().map_err(vol_err)?;
+    let info = vol.journal_info().map_err(|e| vol_err(drive, e))?;
     let pos = JournalPos {
         journal_id: info.journal_id,
         next_usn: info.next_usn as u64,
@@ -141,10 +151,18 @@ fn build_volume(
     Ok(pos)
 }
 
-fn vol_err(e: FsError) -> VolErr {
+fn vol_err(drive: char, e: FsError) -> VolErr {
     match e {
+        // Retrying cannot help: the token does not have volume access.
+        FsError::AccessDenied => VolErr::Fatal(format!(
+            "{e}: MFT/USN access to volume {drive} needs an elevated (Administrator) \
+             or LocalSystem token"
+        )),
         FsError::JournalGone | FsError::NotReady => VolErr::Rebuild,
-        _ => VolErr::Retry(2000),
+        other => {
+            tracing::warn!("volume {drive}: {other}");
+            VolErr::Retry(2000)
+        }
     }
 }
 
@@ -171,7 +189,7 @@ fn watch_loop(
                 }
             }
             Err(FsError::JournalGone) | Err(FsError::NotReady) => {
-                tracing::warn!("volume {drive}: journal unavailable — rebuilding");
+                tracing::warn!("volume {drive}: journal unavailable - rebuilding");
                 return Err(VolErr::Rebuild);
             }
             Err(e) => {

@@ -90,7 +90,7 @@ impl App {
     }
 }
 
-fn resolve_drives(config: &Config) -> Vec<char> {
+pub(crate) fn resolve_drives(config: &Config) -> Vec<char> {
     if config.drives.iter().any(|d| d.eq_ignore_ascii_case("auto")) {
         wfs_fs::detect_fixed_drives()
     } else {
