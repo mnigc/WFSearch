@@ -41,24 +41,50 @@ wfs-server.exe uninstall               # 卸载注册
 
 ## 作为组件集成(由宿主软件更新 exe)
 
-发布渠道是 GitHub Releases:推一个 `v*` tag,CI 构建并把 `wfs-server.exe` 挂到 Release。
-宿主侧的固定下载地址(永远指向最新版):
+发布渠道是 GitHub Releases:推一个 `v*` tag,CI 构建并把两个 exe、两个 `.sha256` 和一份
+`latest.json` 挂上 Release。宿主只认这一个入口,它不需要 API token,因此不受匿名
+`/repos/.../releases/latest` 每小时 60 次的限流:
 
 ```
-https://github.com/mnigc/WFSearch/releases/latest/download/wfs-server.exe
+https://github.com/mnigc/WFSearch/releases/latest/download/latest.json
 ```
 
-更新一个 exe 分三步,顺序不能变:
+```jsonc
+{
+  "version": "0.1.1", "tag": "v0.1.1", "protocol": 1,
+  "released_at": "2026-09-27T07:48:08Z",
+  "assets": {
+    "wfs-server.exe": { "url": "…/releases/download/v0.1.1/wfs-server.exe",
+                        "sha256": "9408…f8b6", "size": 3483136 }
+  }
+}
+```
 
-1. **停**:服务形态 `sc stop WFSearch` 并等待状态变为 STOPPED;子进程形态 `TerminateProcess`
-   后**必须等待进程真正退出**(.NET 的 `Process.Kill()` 是异步的,不等会撞上文件锁)。
-2. **换**:先把旧文件重命名为 `wfs-server.exe.old`——Windows 允许重命名**正在运行**的 exe,
-   所以即使第 1 步失败这一步也总能成功;然后把新 exe 放到原路径。
-3. **起**:`sc start WFSearch` 或重新 `CreateProcess`。快照机制保证重启是暖启动,不重建索引。
+`url` 指向固定版本(想灰度就别追 latest),`protocol` 供宿主判断能力。exe 也始终可以用
+`releases/latest/download/wfs-server.exe` 直接拿最新版。
 
-宿主应在**下次启动时清理**残留的 `.old`(第 2 步改名后若立刻拉起新进程,旧文件当时删不掉)。
+### 换文件:停 → 改名 → 落新 → 起
 
-集成契约——以下三条是对宿主(以及本项目后续版本)的承诺,破坏任何一条"替换一个文件"就不再成立:
+服务的 `binPath` 是写死的,所以**文件名必须保持不变**,换版本因此是这四步:
+
+1. **查**:`GET latest.json`,比 `version` 与本地记录;一样就结束。
+2. **下**:下到临时文件,**校验 SHA-256** 后再用。从浏览器/HTTP 下来的文件带
+   Zone.Identifier 数据流,不清掉会在首次运行时触发 SmartScreen:
+   `Remove-Item -LiteralPath $exe -Stream Zone.Identifier -ErrorAction SilentlyContinue`。
+3. **停 + 换**:`sc stop WFSearch`,轮询 `sc query` 直到 STOPPED(子进程形态则
+   `TerminateProcess` + **等进程真正退出**,.NET 的 `Kill()` 是异步的,不等会撞文件锁)。
+   然后把旧文件**重命名**为 `wfs-server.exe.old` —— Windows 允许重命名正在运行的 exe,
+   所以即使第 3 步没停成功这一步也总能做完,同时它天然就是回滚副本;再把新 exe 放到原路径。
+   `binPath` 没变,**不需要** `sc config`,也不需要重装服务。
+4. **起 + 定论**:`sc start WFSearch`,等 `/api/v1/status` 里各卷 `phase` 到 `ready`。
+   成功了才删掉 `.old`;失败就把 `.old` 改回原名再 `sc start` 一次。快照保证重启是暖启动,
+   1~2 秒内就能判断成败,不必重建索引。
+
+残留的 `.old` 留给**下次宿主启动时**清理(改名后若立刻拉起新进程,旧文件当时删不掉)。
+
+### 集成的前提承诺
+
+以下三条是对宿主(以及本项目后续版本)的承诺,破坏任何一条"替换一个文件"就不再成立:
 
 - **单一 exe、零外部 DLL**:不引入需要随包分发的原生依赖。
 - **数据目录固定在 `%ProgramData%\WFSearch\`**:与 exe 所在路径和文件名无关,换位置不丢索引。

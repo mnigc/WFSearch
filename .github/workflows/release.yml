@@ -1,8 +1,10 @@
 name: Release
 
 # Push a `v*` tag (e.g. `v0.1.1`) to publish `wfs-server.exe` / `wfs-cli.exe`
-# as GitHub Release assets. Integrators then swap a single file via:
-#   https://github.com/mnigc/WFSearch/releases/latest/download/wfs-server.exe
+# as GitHub Release assets. Integrators then update by reading one file:
+#   https://github.com/mnigc/WFSearch/releases/latest/download/latest.json
+# which names the assets, their download URLs and their SHA-256. The binaries are
+# also reachable as releases/latest/download/<file>.
 
 on:
   push:
@@ -26,8 +28,52 @@ jobs:
       - name: build (release)
         run: cargo build --workspace --release
 
+      # Hosts update by fetching one file over plain HTTPS — `releases/latest`
+      # needs no API token, so it is not subject to the 60 req/h anonymous limit
+      # that `/repos/.../releases/latest` imposes. The hashes are tamper-checks
+      # for a download that may be interrupted or served stale, not a substitute
+      # for Authenticode: a host that needs to prove origin must sign the exe.
+      - name: checksums and latest.json
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repo = '${{ github.repository }}'
+          $tag = '${{ github.ref_name }}'
+          $proto = (Select-String -Path crates/wfs-proto/src/lib.rs `
+              -Pattern 'PROTOCOL_VERSION\s*:\s*u32\s*=\s*(\d+)').Matches[0].Groups[1].Value
+
+          New-Item -ItemType Directory dist | Out-Null
+          $assets = [ordered]@{}
+          foreach ($name in @('wfs-server.exe', 'wfs-cli.exe')) {
+            $path = "target/release/$name"
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLower()
+            # written with LF on purpose: `Set-Content` would emit CRLF, which
+            # `sha256sum -c` rejects ("No such file or directory" on the name)
+            [System.IO.File]::WriteAllText("$path.sha256", "$hash  $name`n")
+            $assets[$name] = [ordered]@{
+              url    = "https://github.com/$repo/releases/download/$tag/$name"
+              sha256 = $hash
+              size   = (Get-Item -LiteralPath $path).Length
+            }
+          }
+
+          [ordered]@{
+            version     = $tag.TrimStart('v')
+            tag         = $tag
+            protocol    = [int]$proto
+            released_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+            assets      = $assets
+          } | ConvertTo-Json -Depth 5 | ForEach-Object {
+            [System.IO.File]::WriteAllText('dist/latest.json', "$_`n")
+          }
+
+          Get-Content -LiteralPath dist/latest.json
+
       - uses: softprops/action-gh-release@v2
         with:
           files: |
             target/release/wfs-server.exe
+            target/release/wfs-server.exe.sha256
             target/release/wfs-cli.exe
+            target/release/wfs-cli.exe.sha256
+            dist/latest.json

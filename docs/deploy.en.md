@@ -43,28 +43,58 @@ set `RUST_LOG=debug`.
 
 ## Embedding as a component (host app updates the exe)
 
-The release channel is GitHub Releases: push a `v*` tag and CI builds `wfs-server.exe` and
-attaches it to the Release. The stable download URL for the host app (always the latest):
+The release channel is GitHub Releases: push a `v*` tag and CI attaches both exes, both
+`.sha256` files and a `latest.json` manifest. Hosts follow exactly one entry point — it needs
+no API token, so it is not subject to the 60 requests/hour anonymous limit that
+`/repos/.../releases/latest` imposes:
 
 ```
-https://github.com/mnigc/WFSearch/releases/latest/download/wfs-server.exe
+https://github.com/mnigc/WFSearch/releases/latest/download/latest.json
 ```
 
-Replacing one exe is three steps, in this order:
+```jsonc
+{
+  "version": "0.1.1", "tag": "v0.1.1", "protocol": 1,
+  "released_at": "2026-09-27T07:48:08Z",
+  "assets": {
+    "wfs-server.exe": { "url": "…/releases/download/v0.1.1/wfs-server.exe",
+                        "sha256": "9408…f8b6", "size": 3483136 }
+  }
+}
+```
 
-1. **Stop**: for the service, `sc stop WFSearch` and wait until the state is STOPPED; for a
-   child process, `TerminateProcess` and **wait for it to actually exit** (.NET's
-   `Process.Kill()` is asynchronous — not waiting hits the file lock).
-2. **Swap**: rename the old file to `wfs-server.exe.old` first — Windows allows renaming a
-   **running** exe, so this step succeeds even if step 1 failed — then put the new exe at the
-   original path.
-3. **Start**: `sc start WFSearch` or `CreateProcess` again. Snapshots make the restart warm;
-   no reindex.
+`url` pins one version (use it if you want a staged rollout); `protocol` is what a host checks
+for capabilities. The exe is also always reachable as
+`releases/latest/download/wfs-server.exe` for whoever wants the newest build.
 
-The host should **delete leftover `.old` files on next launch** (a renamed file cannot be
-removed while the old process still holds it).
+### Replacing the file: stop → rename → drop in → start
 
-The integration contract — breaking any of these three invalidates "replace one file":
+A service's `binPath` is baked in, so **the file name must stay the same** — which makes an
+update these four steps:
+
+1. **Check**: `GET latest.json`, compare `version` with what is installed; stop if equal.
+2. **Download**: fetch to a temporary file and **verify the SHA-256** before using it. A file
+   that arrived over HTTP carries a Zone.Identifier stream; leave it and the first run gets
+   SmartScreen'd:
+   `Remove-Item -LiteralPath $exe -Stream Zone.Identifier -ErrorAction SilentlyContinue`.
+3. **Stop + swap**: `sc stop WFSearch`, then poll `sc query` until STOPPED (for a child
+   process: `TerminateProcess` and **wait for it to actually exit** — .NET's `Kill()` is
+   asynchronous, and not waiting hits the file lock). Rename the old file to
+   `wfs-server.exe.old` — Windows allows renaming a **running** exe, so this finishes even if
+   the stop above did not take, and the `.old` doubles as the rollback copy — then put the new
+   exe at the original path. `binPath` is unchanged, so there is **no** `sc config` and no
+   reinstall.
+4. **Start + decide**: `sc start WFSearch`, wait until every volume in `/api/v1/status`
+   reaches `phase: ready`. Only then delete `.old`; if the new build fails, rename `.old`
+   back and start once more. Snapshots make the restart warm, so success or failure is known
+   within 1–2 seconds without reindexing.
+
+Delete a leftover `.old` **on the host's next launch** (a renamed file cannot be removed while
+the old process still holds it).
+
+### What the integration relies on
+
+Breaking any of these three invalidates "replace one file":
 
 - **Single exe, zero external DLLs**: never add a native dependency that must ship alongside.
 - **Data directory fixed at `%ProgramData%\WFSearch\`**: independent of the exe's path and
