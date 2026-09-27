@@ -26,15 +26,26 @@ snapshot.
 
 ## Production deployment (Windows service)
 
+Registration belongs to the **deployer** (or to the host application embedding the engine):
+`wfs-server.exe` has no `install`/`uninstall` subcommand — a service only ever sees the string
+in its `binPath`, and this binary should not decide on someone else's behalf where it lands or
+how many times it is registered.
+
 ```powershell
-# Elevated terminal
-wfs-server.exe install                 # registers the service (LocalSystem, auto-start)
-sc start WFSearch                      # start
+# Elevated terminal. binPath must be absolute; the trailing `run` is the entry
+# subcommand the SCM invokes.
+$exe = 'C:\Program Files\WFSearch\wfs-server.exe'
+sc.exe create WFSearch binPath= "`"$exe`" run" obj= LocalSystem start= auto DisplayName= "WFSearch File Search Engine"
+sc.exe description WFSearch "Fast NTFS filename search engine (MFT index + USN journal). Query via named pipe \\.\pipe\wfs-engine-v1 or http://127.0.0.1:15100."
+sc.exe start WFSearch
 wfs-cli.exe status                     # verify
 
-sc stop WFSearch                       # stop (saves a snapshot automatically)
-wfs-server.exe uninstall               # remove registration
+sc.exe stop WFSearch                   # stop (saves a snapshot automatically)
+sc.exe delete WFSearch                 # remove the registration (stop it first)
 ```
+
+`obj= LocalSystem` is a hard requirement for MFT access. Update versions with the
+"stop → rename → drop in → start" sequence below — do **not** delete and recreate the service.
 
 The service log **appends** to `%ProgramData%\WFSearch\wfs.log` (rotated to `wfs.log.old`
 at startup past 16 MB) — a service process has no console, and without a log file you see

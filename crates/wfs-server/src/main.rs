@@ -1,7 +1,8 @@
 //! wfs-server — WFSearch engine service.
 //!
-//! Modes: interactive console (default), Windows service entry (`run`),
-//! `install` / `uninstall` for the service registration.
+//! Modes: interactive console (default) and the Windows service entry
+//! (`run`, driven by the SCM). Registering the service is the deployer's job —
+//! see docs/deploy.md for the `sc create` form.
 
 mod api;
 mod app;
@@ -51,10 +52,6 @@ enum Command {
     Console,
     /// run as the Windows service entry point (used by the SCM)
     Run,
-    /// register the Windows service (elevated)
-    Install,
-    /// remove the Windows service (elevated)
-    Uninstall,
     /// probe volume access step by step and print every ioctl's result —
     /// run this when a volume is reported as failed
     Doctor {
@@ -83,8 +80,6 @@ fn main() -> anyhow::Result<()> {
     match command {
         Command::Console => console(config),
         Command::Run => service::dispatch().map_err(|e| anyhow::anyhow!("service dispatch: {e}")),
-        Command::Install => service::install(),
-        Command::Uninstall => service::uninstall(),
         Command::Doctor { drives } => doctor(&config, drives),
     }
 }

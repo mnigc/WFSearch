@@ -6,6 +6,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use bincode::Options;
 use wfs_core::{JournalPos, VolumeIndex, VolumePhase};
 use wfs_fs::{resume_position, VolumeHandle};
 
@@ -68,10 +69,19 @@ pub fn save(state: &AppState) -> anyhow::Result<PathBuf> {
 }
 
 /// Read and validate the snapshot file. `None` covers every reason to ignore
-/// it (missing, truncated, foreign format) — all of which mean a full rebuild.
+/// it (missing, truncated, foreign format, failed [`VolumeIndex::validate`]) —
+/// all of which mean a full rebuild.
 fn read_snapshot(state: &AppState) -> Option<SnapshotFile> {
     let bytes = fs::read(file_path(state)).ok()?;
-    let snap: SnapshotFile = match bincode::deserialize(&bytes) {
+    // Bound the read: a length field in a forged snapshot can claim more than
+    // the file holds, and `deserialize` on its own would trust it. The file
+    // size is the honest ceiling for a valid one. Fixint keeps the encoding
+    // the legacy `bincode::serialize` writes (`DefaultOptions` is varint).
+    let snap: SnapshotFile = match bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(bytes.len() as u64)
+        .deserialize(&bytes)
+    {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!("snapshot unreadable ({e}) - full rebuild");
@@ -81,6 +91,18 @@ fn read_snapshot(state: &AppState) -> Option<SnapshotFile> {
     if snap.magic != MAGIC || snap.version != FORMAT_VERSION {
         tracing::warn!("snapshot version mismatch - full rebuild");
         return None;
+    }
+    // Deserialization only guarantees the byte layout. The indexes themselves
+    // go on to be queried through unchecked slices and slot arithmetic, so a
+    // structurally bad one is rejected here rather than trusted.
+    for v in &snap.volumes {
+        if let Err(why) = v.index.validate() {
+            tracing::warn!(
+                "snapshot volume {} rejected ({why}) - full rebuild",
+                v.drive
+            );
+            return None;
+        }
     }
     Some(snap)
 }
@@ -204,5 +226,39 @@ mod tests {
             "tmp file must be renamed away"
         );
         assert!(snapshot_bytes(&st).starts_with(b"WFS1"));
+    }
+
+    /// The file still parses byte-for-byte; only the index inside it is wrong.
+    /// Loading it would hand `NamePool::get_str` a slice outside its arena.
+    #[test]
+    fn structurally_bad_index_is_rejected_not_loaded() {
+        let st = testutil::state();
+        save(&st).unwrap();
+        let mut snap = read_snapshot(&st).unwrap();
+        snap.volumes[0].index.nodes[1].name_len = u32::MAX;
+        fs::write(file_path(&st), bincode::serialize(&snap).unwrap()).unwrap();
+        assert!(
+            read_snapshot(&st).is_none(),
+            "an out-of-bounds name must not load"
+        );
+    }
+
+    /// The shape of the attack the read limit closes: a length prefix claiming
+    /// far more bytes than the file holds.
+    #[test]
+    fn a_forged_length_prefix_is_rejected() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Arena {
+            buf: Vec<u8>,
+        }
+        let mut bytes = bincode::serialize(&Arena { buf: Vec::new() }).unwrap();
+        assert_eq!(bytes.len(), 8, "a lone Vec is just its length prefix");
+        bytes[..8].copy_from_slice(&(1u64 << 60).to_le_bytes());
+
+        assert!(bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(bytes.len() as u64)
+            .deserialize::<Arena>(&bytes)
+            .is_err());
     }
 }

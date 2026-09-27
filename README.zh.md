@@ -58,9 +58,11 @@ cargo run --release -p wfs-client -- search "src\core" --match-path   # 按路�
 $tok = Get-Content "$env:ProgramData\WFSearch\http.token"
 curl "http://127.0.0.1:15100/api/v1/search?q=report&limit=10" -H "x-wfs-token: $tok"
 
-# 3️⃣ 安装为 Windows 服务(管理员)
-wfs-server.exe install
-sc start WFSearch
+# 3️⃣ 注册为 Windows 服务(管理员)。注册由部署方负责,exe 自己不再安装;
+#    binPath 必须是绝对路径。
+$exe = 'C:\Program Files\WFSearch\wfs-server.exe'
+sc.exe create WFSearch binPath= "`"$exe`" run" obj= LocalSystem start= auto
+sc.exe start WFSearch
 
 # 4️⃣ 真实磁盘验收 —— 跑一次拿到全部指标(管理员)
 powershell -ExecutionPolicy Bypass -File scripts\acceptance.ps1
@@ -107,7 +109,7 @@ Web ──127.0.0.1 HTTP──► wfs-server
 | 快照格式(写入/校验/拒绝损坏) | ✅ 已验证 | 往返测试 + 损坏/异版本镜像拒绝测试 |
 | MFT 全量枚举、USN journal 增量 | ✅ 已验证 | 真实盘验收:全量构建 + 变更可见 < 100 ms;字节级解析单测(含 FRN 序列号位回归) |
 | 性能/内存目标(6 项中 5 项) | ✅ 已验证(单机) | 验收脚本五项 PASS(见上表);空闲 CPU 项未覆盖 |
-| 服务安装 / SCM 生命周期 | 🚧 已实现待验证 | 需在目标机 `install` + `sc start` 实测 |
+| 服务 / SCM 生命周期 | 🚧 已实现待验证 | 需在目标机 `sc create` + `sc start` 实测 |
 | 全文检索、拼音、ReFS/网络盘 | ❌ v1 不含 | 不在范围 |
 
 ## 📁 仓库结构

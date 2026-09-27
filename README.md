@@ -59,9 +59,11 @@ cargo run --release -p wfs-client -- search "src\core" --match-path   # match on
 $tok = Get-Content "$env:ProgramData\WFSearch\http.token"
 curl "http://127.0.0.1:15100/api/v1/search?q=report&limit=10" -H "x-wfs-token: $tok"
 
-# 3️⃣ Install as a Windows service (elevated)
-wfs-server.exe install
-sc start WFSearch
+# 3️⃣ Register as a Windows service (elevated). Registration belongs to the
+#    deployer — the exe no longer installs itself. binPath must be absolute.
+$exe = 'C:\Program Files\WFSearch\wfs-server.exe'
+sc.exe create WFSearch binPath= "`"$exe`" run" obj= LocalSystem start= auto
+sc.exe start WFSearch
 
 # 4️⃣ Real-disk acceptance — one run, every metric (elevated)
 powershell -ExecutionPolicy Bypass -File scripts\acceptance.ps1
@@ -112,7 +114,7 @@ Web ──127.0.0.1 HTTP──► wfs-server
 | Snapshot format (write / validate / reject) | ✅ Verified | round-trip + corrupt/foreign-version rejection tests |
 | Full MFT enum, USN journal incrementals | ✅ Verified | real-disk acceptance: build + change visibility < 100 ms; byte-level parsing tests (incl. FRN sequence-bit regression) |
 | Performance & memory targets (5 of 6) | ✅ Verified (one machine) | acceptance script: five gates PASS (table above); idle CPU not covered |
-| Service install / SCM lifecycle | 🚧 Implemented, unverified | needs an on-machine `install` + `sc start` run |
+| Service / SCM lifecycle | 🚧 Implemented, unverified | needs an on-machine `sc create` + `sc start` run |
 | Full-text, pinyin, ReFS/network drives | ❌ Not in v1 | out of scope |
 
 ## 📁 Repository layout

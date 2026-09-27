@@ -246,7 +246,7 @@ function renderOffline() {
   $('#banner').innerHTML =
     `<div class="banner bad">🔌 连不上引擎(127.0.0.1 的 HTTP 未监听)。在管理员终端启动:
      <div style="margin-top:6px"><span class="cmd">cargo run --release -p wfs-server -- console</span></div>
-     或安装为服务:<span class="cmd">wfs-server.exe install</span>,然后刷新本页。</div>`;
+     或以服务方式启动:<span class="cmd">sc.exe start WFSearch</span>,然后刷新本页。</div>`;
   $('#fuptime').textContent = '';
 }
 function renderAuth() {

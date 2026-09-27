@@ -1,6 +1,11 @@
-//! Windows service lifecycle: SCM dispatch, install/uninstall.
+//! Windows service lifecycle: the SCM dispatch entry point.
+//!
+//! Registering or removing the service is deliberately not this binary's job.
+//! The deployer (or the host application embedding the engine) owns the
+//! `sc create` / `sc delete` calls — see docs/deploy.md.
 
 use std::ffi::OsString;
+use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 use windows_service::service::{
@@ -12,9 +17,6 @@ use windows_service::{define_windows_service, service_dispatcher};
 use crate::{app, config, snapshot};
 
 pub const SERVICE_NAME: &str = "WFSearch";
-pub const SERVICE_DISPLAY: &str = "WFSearch File Search Engine";
-pub const SERVICE_DESC: &str =
-    "Fast NTFS filename search engine (MFT index + USN journal). Query via named pipe \\\\.\\pipe\\wfs-engine-v1 or http://127.0.0.1:15100.";
 
 define_windows_service!(ffi_service_main, service_main);
 
@@ -51,8 +53,7 @@ fn run_as_service() -> windows_service::Result<()> {
     };
     handler.set_service_status(status.clone())?;
 
-    let cfg = config::Config::load(None);
-    let application = match app::boot(cfg) {
+    let application = match boot_waiting_for_the_port(&rx) {
         Ok(a) => a,
         Err(e) => {
             tracing::error!("boot failed: {e}");
@@ -62,7 +63,6 @@ fn run_as_service() -> windows_service::Result<()> {
             return Ok(());
         }
     };
-
     let _ = rx.recv(); // block until Stop/Shutdown
 
     let _ = snapshot::save(&application.state);
@@ -73,50 +73,49 @@ fn run_as_service() -> windows_service::Result<()> {
     Ok(())
 }
 
-pub fn install() -> anyhow::Result<()> {
-    use windows_service::service::{
-        ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType,
-    };
-    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+/// How long the service keeps trying to come up before it gives up and reports
+/// itself stopped: 20 * 3s outlasts an SVCode session that is about to close.
+const BOOT_ATTEMPTS: u32 = 20;
+const BOOT_RETRY_GAP: Duration = Duration::from_secs(3);
 
-    let manager = ServiceManager::local_computer(
-        None::<&str>,
-        ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
-    )?;
-    let exe = std::env::current_exe()?;
-    let info = ServiceInfo {
-        name: SERVICE_NAME.into(),
-        display_name: SERVICE_DISPLAY.into(),
-        service_type: ServiceType::OWN_PROCESS,
-        start_type: ServiceStartType::AutoStart,
-        error_control: ServiceErrorControl::Normal,
-        executable_path: exe,
-        launch_arguments: vec!["run".into()],
-        dependencies: vec![],
-        account_name: None, // LocalSystem — required for MFT access
-        account_password: None,
-    };
-    let svc = manager.create_service(&info, ServiceAccess::CHANGE_CONFIG)?;
-    svc.set_description(SERVICE_DESC)?;
-    println!(
-        "service '{SERVICE_NAME}' installed (autostart). Start it with: sc start {SERVICE_NAME}"
-    );
-    Ok(())
+/// The gateway port belongs to whoever binds it first, and straight after a
+/// (re)start that is usually the plain-user sidecar an older SVCode left
+/// running — one that can bind 15100 but cannot read a single MFT. Exiting on
+/// `AddrInUse` handed the impostor the port for good and left the service
+/// stopped with nothing to restart it, so the boot is retried until the port
+/// frees.
+///
+/// `Running` is reported before the first attempt: the SCM times a
+/// `StartPending` service out after 30 s, and an engine that comes up a few
+/// seconds late beats a start the services console shows as failed.
+fn boot_waiting_for_the_port(rx: &Receiver<()>) -> anyhow::Result<app::App> {
+    let mut last: Option<anyhow::Error> = None;
+    for attempt in 1..=BOOT_ATTEMPTS {
+        match app::boot(config::Config::load(None)) {
+            Ok(application) => return Ok(application),
+            Err(e) => {
+                tracing::warn!("boot failed (attempt {attempt}/{BOOT_ATTEMPTS}): {e}");
+                last = Some(e);
+            }
+        }
+        if stop_requested(rx) {
+            break;
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("boot failed")))
 }
 
-pub fn uninstall() -> anyhow::Result<()> {
-    use windows_service::service::{ServiceAccess, ServiceState};
-    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
-
-    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
-    let svc = manager.open_service(
-        SERVICE_NAME,
-        ServiceAccess::DELETE | ServiceAccess::QUERY_STATUS,
-    )?;
-    if svc.query_status()?.current_state != ServiceState::Stopped {
-        anyhow::bail!("service is running; stop it first: sc stop {SERVICE_NAME}");
+/// Waits out one retry gap, returning early when the SCM asked us to stop so
+/// `net stop` is not held up for the rest of the window.
+fn stop_requested(rx: &Receiver<()>) -> bool {
+    const TICK: Duration = Duration::from_millis(200);
+    let mut waited = Duration::ZERO;
+    while waited < BOOT_RETRY_GAP {
+        if rx.try_recv().is_ok() {
+            return true;
+        }
+        std::thread::sleep(TICK);
+        waited += TICK;
     }
-    svc.delete()?;
-    println!("service '{SERVICE_NAME}' removed");
-    Ok(())
+    false
 }

@@ -25,6 +25,30 @@ pub const SDDL_OPEN: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)";
 /// SYSTEM + Administrators, full access.
 pub const SDDL_ADMINS_ONLY: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)";
 
+/// SYSTEM + Administrators full, Interactive Users read-only. The default for
+/// engine-owned *files*: the population that may query the engine may also read
+/// the HTTP token and the index, but only the engine may rewrite them.
+pub const SDDL_OPEN_RO: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;IU)";
+
+/// The data directory, under `acl = "open"` and `acl = "restricted"`.
+///
+/// `P` drops the inherited ACEs — `%ProgramData%` ships
+/// `Users:(OI)(CI)(WD,AD,WEA,WA)`, which lets any local user create files in a
+/// subdirectory and, if they created it, own it. `(OI)(CI)` passes these ACEs
+/// on to the files created inside.
+pub const SDDL_DIR_OPEN: &str = "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)(A;OICI;GR;;;IU)";
+pub const SDDL_DIR_ADMINS_ONLY: &str = "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)";
+
+const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
+const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x8000_0000;
+/// `CreateFileW` refuses to open a directory without it.
+const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+/// `WELL_KNOWN_SID_TYPE` values used by [`current_process_is_privileged`].
+const WIN_LOCAL_SYSTEM_SID: u32 = 22;
+const WIN_BUILTIN_ADMINISTRATORS_SID: u32 = 26;
+/// `SECURITY_MAX_SID_SIZE`
+const MAX_SID_BYTES: usize = 68;
+
 const READ_CONTROL: u32 = 0x0002_0000;
 const GENERIC_READ: u32 = 0x8000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
@@ -70,6 +94,32 @@ extern "system" {
         securityinformation: u32,
         stringsecuritydescriptor: *mut *mut u16,
         stringsecuritydescriptorsize: *mut u32,
+    ) -> i32;
+    fn SetNamedSecurityInfoW(
+        objectname: *mut u16,
+        objecttype: u32,
+        securityinformation: u32,
+        sidowner: *mut c_void,
+        sidgroup: *mut c_void,
+        dacl: *mut c_void,
+        sacl: *mut c_void,
+    ) -> u32;
+    fn GetSecurityDescriptorDacl(
+        securitydescriptor: *const c_void,
+        daclpresent: *mut i32,
+        dacl: *mut *mut c_void,
+        dacldefaulted: *mut i32,
+    ) -> i32;
+    fn CheckTokenMembership(
+        tokenhandle: *mut c_void,
+        sidtocheck: *mut c_void,
+        ismember: *mut i32,
+    ) -> i32;
+    fn CreateWellKnownSid(
+        wellknownsidtype: u32,
+        domainsid: *mut c_void,
+        sid: *mut c_void,
+        cbsid: *mut u32,
     ) -> i32;
 }
 
@@ -134,6 +184,27 @@ impl SecurityDescriptor {
         &mut self.attrs as *mut SecurityAttributes as *mut c_void
     }
 
+    /// The DACL inside this descriptor, for [`SetNamedSecurityInfoW`]. Valid
+    /// only while `self` is alive.
+    ///
+    /// Every out-parameter gets a real local: despite the SDK documenting
+    /// `lpbDaclDefaulted` as optional, passing NULL faults on at least
+    /// Windows 11 24H2 (observed `STATUS_ACCESS_VIOLATION`).
+    fn dacl(&mut self) -> Result<*mut c_void, FsError> {
+        let mut present: i32 = 0;
+        let mut dacl: *mut c_void = null_mut();
+        let mut defaulted: i32 = 0;
+        let ok =
+            unsafe { GetSecurityDescriptorDacl(self.sd, &mut present, &mut dacl, &mut defaulted) };
+        if ok == 0 || present == 0 || dacl.is_null() {
+            return Err(FsError::Other(format!(
+                "security descriptor carries no DACL (win32 error {})",
+                unsafe { crate::GetLastError() }
+            )));
+        }
+        Ok(dacl)
+    }
+
     /// Create `path` carrying this DACL, written in one go.
     ///
     /// The descriptor is attached at create time on purpose: writing the file
@@ -188,6 +259,66 @@ impl Drop for SecurityDescriptor {
             unsafe { LocalFree(self.sd) };
         }
     }
+}
+
+/// Replace `path`'s DACL with `sddl`, and stop it inheriting anything else.
+///
+/// This is the existing-object counterpart of [`SecurityDescriptor::write_file`]
+/// (which attaches a descriptor at create time). The data directory usually
+/// predates the first hardened boot, and so do the files inside it.
+pub fn set_dacl(path: &Path, sddl: &str) -> Result<(), FsError> {
+    let mut sd = SecurityDescriptor::from_sddl(sddl)?;
+    let dacl = sd.dacl()?;
+    let mut name = crate::wide(&path.display().to_string());
+    let rc = unsafe {
+        SetNamedSecurityInfoW(
+            name.as_mut_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            dacl,
+            null_mut(),
+        )
+    };
+    if rc != 0 {
+        return Err(FsError::Other(format!(
+            "set the ACL of {}: win32 error {rc}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Whether this process's token really holds Administrators (or is SYSTEM).
+///
+/// A UAC-filtered token carries Administrators deny-only, and
+/// `CheckTokenMembership` reports false for it — which is exactly the
+/// distinction that matters: rewriting the data directory's DACL down to
+/// SYSTEM + Administrators would lock an unprivileged caller out of the
+/// directory it is about to write into.
+pub fn current_process_is_privileged() -> bool {
+    fn holds(sid_type: u32) -> bool {
+        let mut sid = [0u8; MAX_SID_BYTES];
+        let mut len = MAX_SID_BYTES as u32;
+        let ok = unsafe {
+            CreateWellKnownSid(
+                sid_type,
+                null_mut(),
+                sid.as_mut_ptr() as *mut c_void,
+                &mut len,
+            )
+        };
+        if ok == 0 {
+            return false;
+        }
+        let mut member: i32 = 0;
+        let ok = unsafe {
+            CheckTokenMembership(null_mut(), sid.as_mut_ptr() as *mut c_void, &mut member)
+        };
+        ok != 0 && member != 0
+    }
+    holds(WIN_BUILTIN_ADMINISTRATORS_SID) || holds(WIN_LOCAL_SYSTEM_SID)
 }
 
 /// A hex token for HTTP bearer auth (32 chars = 128 bits of system entropy).
@@ -257,7 +388,17 @@ pub fn sddl_of_handle(handle: isize, objecttype: u32) -> Result<String, FsError>
 
 /// The SDDL form of a file's security descriptor, opened by path.
 pub fn object_sddl(path: &str) -> Result<String, FsError> {
-    let handle = open_for_security_query(path, READ_CONTROL)?;
+    let handle = open_for_security_query(path, READ_CONTROL, 0)?;
+    let result = sddl_of_handle(handle, SE_FILE_OBJECT);
+    unsafe { crate::CloseHandle(handle) };
+    result
+}
+
+/// The SDDL form of a directory's security descriptor (owner first, so
+/// `O:SY`/`O:BA` says the owner is trusted and anything else is a warning
+/// worth printing).
+pub fn dir_sddl(path: &str) -> Result<String, FsError> {
+    let handle = open_for_security_query(path, READ_CONTROL, FILE_FLAG_BACKUP_SEMANTICS)?;
     let result = sddl_of_handle(handle, SE_FILE_OBJECT);
     unsafe { crate::CloseHandle(handle) };
     result
@@ -273,16 +414,25 @@ pub fn object_sddl(path: &str) -> Result<String, FsError> {
 /// makes this usable as a regression test: the DACL is checked by an open that
 /// the DACL itself gates.
 pub fn pipe_sddl(path: &str) -> Result<String, FsError> {
-    let handle = open_for_security_query(path, READ_CONTROL | GENERIC_READ | GENERIC_WRITE)?;
+    let handle = open_for_security_query(path, READ_CONTROL | GENERIC_READ | GENERIC_WRITE, 0)?;
     let result = sddl_of_handle(handle, SE_KERNEL_OBJECT);
     unsafe { crate::CloseHandle(handle) };
     result
 }
 
-fn open_for_security_query(path: &str, access: u32) -> Result<isize, FsError> {
+fn open_for_security_query(path: &str, access: u32, flags: u32) -> Result<isize, FsError> {
     let name = crate::wide(path);
-    let handle =
-        unsafe { crate::CreateFileW(name.as_ptr(), access, 0, null(), crate::OPEN_EXISTING, 0, 0) };
+    let handle = unsafe {
+        crate::CreateFileW(
+            name.as_ptr(),
+            access,
+            0,
+            null(),
+            crate::OPEN_EXISTING,
+            flags,
+            0,
+        )
+    };
     if handle == -1 {
         return Err(FsError::Other(format!(
             "open {path} for security query: win32 error {}",
@@ -344,6 +494,87 @@ mod tests {
         assert!(sddl.contains("BA"), "{sddl}");
         assert!(sddl.contains("IU"), "{sddl}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "deadbeef");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("wfs-sec-{tag}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// `set_dacl` is the existing-object path: it has to replace whatever was
+    /// inherited *and* mark the result protected, or the `Users:(WD,AD)` ACE
+    /// that `%ProgramData%` hands down would survive underneath it.
+    #[test]
+    fn set_dacl_replaces_and_protects_a_directory() {
+        let dir = temp_dir("dir");
+        set_dacl(&dir, SDDL_DIR_OPEN).unwrap();
+
+        let sddl = dir_sddl(&dir.display().to_string()).unwrap();
+        assert!(sddl.contains("SY"), "{sddl}");
+        assert!(sddl.contains("BA"), "{sddl}");
+        assert!(sddl.contains("IU"), "{sddl}");
+        let flags = sddl
+            .split("D:")
+            .nth(1)
+            .and_then(|rest| rest.split('(').next())
+            .unwrap_or_default();
+        assert!(flags.contains('P'), "the DACL must be protected: {sddl}");
+        assert!(!flags.contains("WD"), "{sddl}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Files get read-only for interactive users — writing one back is the
+    /// engine's job, and a user-writable `index.bin` is the whole bug.
+    ///
+    /// The DACL is read back through the object, so the ACEs come out in their
+    /// *file-specific* spelling: `SetNamedSecurityInfoW` maps the generic
+    /// `GA`/`GR` down to `FA`/`FR` when it applies them.
+    #[test]
+    fn set_dacl_leaves_an_existing_file_read_only_for_users() {
+        let dir = temp_dir("file");
+        let path = dir.join("index.bin");
+        std::fs::write(&path, b"x").unwrap();
+        set_dacl(&path, SDDL_OPEN_RO).unwrap();
+
+        let sddl = object_sddl(&path.display().to_string()).unwrap();
+        assert!(sddl.contains("A;;FR;;;IU"), "{sddl}");
+        assert!(!sddl.contains("A;;FA;;;IU"), "{sddl}");
+        assert!(!sddl.contains("A;;GA;;;IU"), "{sddl}");
+        assert!(sddl.contains("A;;FA;;;SY"), "{sddl}");
+        assert!(sddl.contains("A;;FA;;;BA"), "{sddl}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn every_sddl_constant_converts() {
+        for sddl in [
+            SDDL_OPEN,
+            SDDL_ADMINS_ONLY,
+            SDDL_OPEN_RO,
+            SDDL_DIR_OPEN,
+            SDDL_DIR_ADMINS_ONLY,
+        ] {
+            assert!(SecurityDescriptor::from_sddl(sddl).is_ok(), "{sddl}");
+        }
+    }
+
+    /// The probe's whole job is to predict whether a directory hardened down to
+    /// SYSTEM + Administrators would still admit this process. Ownership is not
+    /// enough to write into a directory, so a create is the honest check.
+    #[test]
+    fn privileged_probe_matches_reality() {
+        let dir = temp_dir("priv");
+        set_dacl(&dir, SDDL_DIR_ADMINS_ONLY).unwrap();
+
+        let can_write = std::fs::write(dir.join("probe"), b"x").is_ok();
+        assert_eq!(
+            can_write,
+            current_process_is_privileged(),
+            "SY+BA alone must admit exactly the tokens the probe calls privileged"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

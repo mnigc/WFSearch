@@ -25,15 +25,23 @@ REPL:输入查询词直接搜索;`status` 查看索引进度;`quit` 退出并落
 
 ## 生产部署(Windows 服务)
 
+注册由**部署方**(或嵌入引擎的宿主程序)负责,`wfs-server.exe` 自身没有 `install`/`uninstall`
+子命令 —— 服务只认 `binPath` 里的那个字符串,而这个二进制不该替别人决定装到哪、装几次。
+
 ```powershell
-# 管理员终端
-wfs-server.exe install                 # 注册服务(LocalSystem,自启动)
-sc start WFSearch                      # 启动
+# 管理员终端。binPath 必须是绝对路径;结尾的 `run` 是 SCM 调用的入口子命令。
+$exe = 'C:\Program Files\WFSearch\wfs-server.exe'
+sc.exe create WFSearch binPath= "`"$exe`" run" obj= LocalSystem start= auto DisplayName= "WFSearch File Search Engine"
+sc.exe description WFSearch "Fast NTFS filename search engine (MFT index + USN journal). Query via named pipe \\.\pipe\wfs-engine-v1 or http://127.0.0.1:15100."
+sc.exe start WFSearch
 wfs-cli.exe status                     # 验证
 
-sc stop WFSearch                       # 停止(自动保存快照)
-wfs-server.exe uninstall               # 卸载注册
+sc.exe stop WFSearch                   # 停止(自动保存快照)
+sc.exe delete WFSearch                 # 卸载注册(先停止)
 ```
+
+`obj= LocalSystem` 是 MFT 访问的硬要求。换版本走下面的"停 → 改名 → 落新 → 起",
+**不要**删了重建服务(重建会丢掉 `binPath` 之外的一切,还要重新拷文件)。
 
 服务日志**追加**到 `%ProgramData%\WFSearch\wfs.log`(超过 16MB 时启动时轮转为 `wfs.log.old`)——
 服务进程没有控制台,不落文件就什么也看不到。调试时可先 `console` 模式排查(日志到 stderr),

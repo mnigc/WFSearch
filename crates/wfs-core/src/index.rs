@@ -13,7 +13,11 @@ pub const ROOT_FRN: u64 = 5;
 
 const MAX_PATH_DEPTH: usize = 512;
 
-/// Packed UTF-8 name arena. Invariant: only valid UTF-8 ever enters `buf`.
+/// Packed UTF-8 name arena.
+///
+/// Invariant: only valid UTF-8 ever enters `buf`. In-process construction
+/// cannot break it; a snapshot can, so [`VolumeIndex::validate`] re-checks it
+/// on load.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct NamePool {
     pub buf: Vec<u8>,
@@ -262,6 +266,70 @@ impl VolumeIndex {
         s
     }
 
+    /// Check the invariants that in-process construction cannot break but a
+    /// snapshot can.
+    ///
+    /// [`NamePool::get_str`] is unchecked (the query path cannot afford a
+    /// UTF-8 pass per candidate) and the tree walks index `nodes` by slot, so
+    /// a hand-edited or bit-rotted `index.bin` would otherwise turn into UB or
+    /// a panic inside the SYSTEM process. Snapshot loading rejects anything
+    /// that fails here and rebuilds instead.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.nodes.is_empty() {
+            return Err("no root node".into());
+        }
+        let root = &self.nodes[0];
+        if root.parent != u32::MAX || root.flags & FLAG_DIR == 0 {
+            return Err("slot 0 is not the volume root".into());
+        }
+        if self.frn_index.get(&ROOT_FRN) != Some(&0) {
+            return Err("the root FRN does not map to slot 0".into());
+        }
+        if self.deleted as usize > self.nodes.len() {
+            return Err(format!(
+                "{} tombstones for {} nodes",
+                self.deleted,
+                self.nodes.len()
+            ));
+        }
+        let arena = self.names.buf.len();
+        for (slot, n) in self.nodes.iter().enumerate() {
+            let start = n.name_off as usize;
+            let end = start
+                .checked_add(n.name_len as usize)
+                .filter(|&e| e <= arena)
+                .ok_or_else(|| {
+                    format!("slot {slot}: name {start}+{} outside the arena", n.name_len)
+                })?;
+            if std::str::from_utf8(&self.names.buf[start..end]).is_err() {
+                return Err(format!("slot {slot}: name is not UTF-8"));
+            }
+            if n.parent != u32::MAX && n.parent as usize >= self.nodes.len() {
+                return Err(format!("slot {slot}: parent {} out of range", n.parent));
+            }
+        }
+        for (&parent, kids) in &self.children {
+            if parent as usize >= self.nodes.len() {
+                return Err(format!("children key {parent} out of range"));
+            }
+            for &kid in kids {
+                if kid as usize >= self.nodes.len() {
+                    return Err(format!("child slot {kid} out of range"));
+                }
+            }
+        }
+        // every live node is reachable by FRN: `mark_deleted` drops the FRNs
+        // of the whole tombstoned subtree, so the two counts must agree
+        let live = self.nodes.len() - self.deleted as usize;
+        if self.frn_index.len() != live {
+            return Err(format!(
+                "{} FRNs for {live} live nodes",
+                self.frn_index.len()
+            ));
+        }
+        Ok(())
+    }
+
     pub fn approx_memory(&self) -> u64 {
         let dirs = self.children.len() as u64;
         self.names.buf.len() as u64
@@ -375,5 +443,69 @@ mod tests {
             v.insert(20, 12, "under-ghost.txt", false),
             InsertOutcome::Orphan
         );
+    }
+
+    #[test]
+    fn validate_accepts_what_the_index_builds() {
+        assert!(tree().validate().is_ok());
+        let mut v = tree();
+        v.mark_deleted(10); // tombstones + FRN bookkeeping must stay consistent
+        v.rename(14, ROOT_FRN, "renamed.log");
+        v.insert(15, 12, "under-ghost.txt", false);
+        assert_eq!(v.validate(), Ok(()));
+    }
+
+    #[test]
+    fn validate_rejects_a_name_outside_the_arena() {
+        let mut v = tree();
+        v.nodes[1].name_off = u32::MAX;
+        assert!(v.validate().is_err());
+
+        let mut v = tree();
+        v.nodes[1].name_len = 1_000_000;
+        assert!(v.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_a_name_that_is_not_utf8() {
+        let mut v = tree();
+        let off = v.names.buf.len() as u32;
+        v.names.buf.push(0xff);
+        v.nodes[1].name_off = off;
+        v.nodes[1].name_len = 1;
+        assert!(v.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_slots_out_of_range() {
+        let mut v = tree();
+        v.nodes[2].parent = 9_999;
+        assert!(v.validate().is_err());
+
+        let mut v = tree();
+        v.children.get_mut(&1).unwrap().push(9_999);
+        assert!(v.validate().is_err());
+
+        let mut v = tree();
+        v.children.insert(9_999, vec![1]);
+        assert!(v.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_a_root_that_is_not_slot_zero() {
+        let mut v = tree();
+        v.nodes.swap(0, 1); // the root is no longer where `path_of` looks for it
+        assert!(v.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_an_frn_map_disagreeing_with_the_tombstones() {
+        let mut v = tree();
+        v.deleted = 1; // tombstone count without a tombstone
+        assert!(v.validate().is_err());
+
+        let mut v = tree();
+        v.frn_index.remove(&11); // live node with no FRN
+        assert!(v.validate().is_err());
     }
 }
