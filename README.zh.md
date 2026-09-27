@@ -2,8 +2,10 @@
 
 # 🔍 WFSearch
 
-**Windows 上的极速文件名搜索服务。**
+**Windows Flash Search**
 
+**Windows 上的极速文件名搜索服务。**
+ 
 *整卷 NTFS MFT 常驻内存索引 · USN Journal 实时增量 · Named Pipe + 本地 HTTP 查询。*
 
 [![CI](https://github.com/mnigc/WFSearch/actions/workflows/ci.yml/badge.svg)](https://github.com/mnigc/WFSearch/actions/workflows/ci.yml)
@@ -51,9 +53,10 @@ cargo run --release -p wfs-server -- console
 
 # 2️⃣ 另开终端查询
 cargo run --release -p wfs-client -- search "*.rs"     # named pipe
-cargo run --release -p wfs-client -- status --http     # HTTP 通道
+cargo run --release -p wfs-client -- status --http     # HTTP 通道(自己读 token)
 cargo run --release -p wfs-client -- search "src\core" --match-path   # 按路径匹配
-curl "http://127.0.0.1:15100/api/v1/search?q=report&limit=10"
+$tok = Get-Content "$env:ProgramData\WFSearch\http.token"
+curl "http://127.0.0.1:15100/api/v1/search?q=report&limit=10" -H "x-wfs-token: $tok"
 
 # 3️⃣ 安装为 Windows 服务(管理员)
 wfs-server.exe install
@@ -134,12 +137,13 @@ http_port = 15100          # 仅绑定 127.0.0.1
 pipe_name = "\\\\.\\pipe\\wfs-engine-v1"
 poll_ms = 100              # journal 轮询间隔
 max_limit = 1000           # 单次查询 limit 上限
-pipe_acl = "open"          # 管道 DACL:open(默认)| restricted(仅 SYSTEM + 管理员)
+acl = "open"               # 谁能访问引擎:open(默认)| restricted
 ```
 
-> 💡 `pipe_acl = "restricted"` 把 *pipe* 查询限制为 SYSTEM + Administrators;写错的值
-> 回退 `open` 并大声告警,不会静默降级。注意 pipe 的 ACL **不影响 HTTP 通道**:HTTP
-> 始终只绑回环,但本机任何用户都能访问 —— 要完全收紧得两个通道一起考虑。
+> 💡 `acl = "restricted"` 同时收紧**两个通道**,只放行 SYSTEM + Administrators;`open`
+> 放行所有控制台登录用户。写错的值回退 `open` 并大声告警,不会静默降级。pipe 靠 DACL
+> 鉴权(操作系统白送);HTTP 靠 bearer token —— 令牌发布在 `%ProgramData%\WFSearch\http.token`,
+> 因为回环连接不携带用户身份。**能读到这个文件就等于有凭证**,而 `acl` 正是控制这一点的。
 
 ## 📚 文档
 

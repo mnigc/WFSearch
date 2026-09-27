@@ -41,12 +41,22 @@ if __name__ == "__main__":
 
 ## Python — HTTP
 
+HTTP 不带用户身份,所以每个请求都要在 `x-wfs-token` 里附上数据目录下 `http.token` 的内容。
+token 每次引擎启动换发,别缓存。
+
 ```python
-import json, urllib.parse, urllib.request
+import json, os, urllib.parse, urllib.request
+
+TOKEN_PATH = os.path.join(os.environ["ProgramData"], "WFSearch", "http.token")
+
+def token() -> str:
+    with open(TOKEN_PATH, encoding="utf-8") as f:
+        return f.read().strip()
 
 def search(q: str, limit: int = 20):
     url = "http://127.0.0.1:15100/api/v1/search?" + urllib.parse.urlencode({"q": q, "limit": limit})
-    with urllib.request.urlopen(url) as resp:
+    req = urllib.request.Request(url, headers={"x-wfs-token": token()})
+    with urllib.request.urlopen(req) as resp:
         return json.load(resp)
 ```
 
@@ -87,9 +97,13 @@ Console.WriteLine(resp.GetProperty("data").GetProperty("total_matched"));
 ## C# — HTTP
 
 ```csharp
+var token = (await File.ReadAllTextAsync(
+    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+        "WFSearch", "http.token"))).Trim();
+using var http = new HttpClient();
+http.DefaultRequestHeaders.Add("x-wfs-token", token);
 var url = "http://127.0.0.1:15100/api/v1/search?q=" + Uri.EscapeDataString("*.docx") + "&limit=20";
-var resp = await JsonSerializer.DeserializeAsync<JsonElement>(
-    await new HttpClient().GetStreamAsync(url));
+var resp = await JsonSerializer.DeserializeAsync<JsonElement>(await http.GetStreamAsync(url));
 ```
 
 ## Rust(wfs-client crate)
@@ -104,6 +118,10 @@ for f in &r.results { println!("{}", f.path); }
 
 // 按路径匹配(把文件名匹配换成整条路径匹配;慢 5~10×)
 let r = c.search(&SearchReq { q: r"projects\2026".into(), match_path: true, ..Default::default() }).unwrap();
+
+// HTTP 通道:token 由 load_token() 从 <ProgramData>\WFSearch\http.token 读出
+let token = wfs_client::load_token().unwrap();
+let r = wfs_client::search_http(&SearchReq { q: "*.md".into(), ..Default::default() }, 15100, &token).unwrap();
 ```
 
 `SearchReq` 除 `q` 外都有默认值:`limit=100`、`offset=0`、`sort=SortKind::None`、`match_path=false`。
@@ -113,6 +131,7 @@ let r = c.search(&SearchReq { q: r"projects\2026".into(), match_path: true, ..De
 1. **复用连接**:pipe 连接建立后可连续发多个请求(每请求一帧),避免反复连接。
 2. **分页**:`total_matched` 是全量命中数,用 `offset`/`limit` 取页;默认按索引序返回(最快)。
 3. **就绪判断**:服务启动即监听;客户端应先查 `status` 里对应卷 `phase == "ready"` 再展示"无结果",避免索引未完成时误判。
-4. **错误处理**:`{"type":"err","data":{"code":1|2|3,"message":...}}`,HTTP 侧对应 4xx/5xx。
+4. **错误处理**:`{"type":"err","data":{"code":1|2|3,"message":...}}`,HTTP 侧对应 4xx/5xx;
+   另有仅 HTTP 出现的 `code: 4`(token 缺失或不对 → `401`)。
 5. **路径匹配**:查询词里含 `\` 或 `/` 的词会自动按路径匹配;要按路径匹配**全部**词则设 `match_path=true`(Named Pipe)或 `match_path=true`(HTTP 查询参数)。只搜文件名时不要开,慢 5~10×。
-6. **权限**:服务端 `pipe_acl = "restricted"` 时,pipe 仅 SYSTEM + Administrators 可连;普通用户客户端会收到"拒绝访问",此时改用 HTTP(仅回环)或提升权限。
+6. **权限**:`acl = "restricted"` 同时收紧两个通道 —— pipe 仅 SYSTEM + Administrators 可连(普通用户收到"拒绝访问"),`http.token` 也只有这几类用户读得到(其他人拿 HTTP 只会吃到 401)。默认 `open` 下本机登录用户两个通道都能用。

@@ -9,9 +9,15 @@ Two transports carry identical payloads (JSON, UTF-8):
 | Named Pipe (preferred) | `\\.\pipe\wfs-engine-v1` | 4-byte little-endian length + JSON; requests/responses are symmetric; the connection is reusable |
 | HTTP (auxiliary) | `http://127.0.0.1:15100` | plain REST, see below |
 
-Per-frame cap: 4 MB. The pipe DACL defaults to the Windows default (any local user may
-connect); `pipe_acl = "restricted"` tightens it to SYSTEM + Administrators (see
-[deploy.en.md](deploy.en.md)).
+Per-frame cap: 4 MB. Authentication differs per channel and is selected by the one config
+key `acl` (see [deploy.en.md](deploy.en.md)):
+
+* **Named Pipe**: the DACL does the work, and the OS enforces it at connect time. `open`
+  (default) admits anyone signed in at the console; `restricted` admits only SYSTEM +
+  Administrators.
+* **HTTP**: a bearer token. A loopback connection carries no user identity, so every request
+  must send `x-wfs-token` with the contents of `http.token` in the data directory. That
+  file's DACL follows `acl` — reading it *is* holding the credential.
 
 ## Named Pipe
 
@@ -65,20 +71,29 @@ search suffices.
 
 `phase`: `building` | `ready` | `failed`.
 
-Error codes: `1` invalid request, `2` not ready, `3` internal error.
+Error codes: `1` invalid request, `2` not ready, `3` internal error, `4` missing or wrong
+token (HTTP only — a pipe connection already carries the client's Windows identity, so `4`
+never appears on the pipe).
 
 ## HTTP API (127.0.0.1 only)
 
 ```
+GET /                          # the same-origin demo UI (needs the token, see below)
 GET /api/v1/search?q=<query>&limit=100&offset=0&sort=none&match_path=false
 GET /api/v1/status
 POST /api/v1/snapshot          # flush a snapshot manually
 ```
 
+Every request must send `x-wfs-token: <contents of http.token>`. An address bar cannot set a
+header, so open the demo UI with the query form instead: `http://127.0.0.1:15100/?token=…` —
+once loaded, the page's own `fetch` calls switch back to the header. The token is generated at
+startup and written to `http.token` in the data directory, under a DACL that follows `acl`.
+
 `match_path` accepts `1` / `true` (case-insensitive); anything else counts as `false`.
 
 Responses are the `data` objects from the table above (SearchResp / StatusResp JSON);
-errors return the matching HTTP status code + `ErrorPayload` (empty `q` → `400` + code 1).
+errors return the matching HTTP status code + `ErrorPayload` (empty `q` → `400` + code 1,
+bad token → `401` + code 4).
 
 ## Frame example (Python)
 

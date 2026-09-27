@@ -118,6 +118,9 @@ impl Response {
 pub const ERR_BAD_REQUEST: u32 = 1;
 pub const ERR_NOT_READY: u32 = 2;
 pub const ERR_INTERNAL: u32 = 3;
+/// HTTP only: the bearer token was absent or wrong. The named pipe carries the
+/// client's Windows identity instead, so it never returns this.
+pub const ERR_UNAUTHORIZED: u32 = 4;
 
 /// The JSON shapes below are a published contract: `docs/protocol.md` and the
 /// Python/C# samples in `docs/clients.md` are written against them by hand, so

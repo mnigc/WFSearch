@@ -42,12 +42,23 @@ if __name__ == "__main__":
 
 ## Python — HTTP
 
+A loopback connection carries no user identity, so every request must send the contents of
+`http.token` in the data directory as `x-wfs-token`. The token is re-issued at each engine
+start — do not cache it.
+
 ```python
-import json, urllib.parse, urllib.request
+import json, os, urllib.parse, urllib.request
+
+TOKEN_PATH = os.path.join(os.environ["ProgramData"], "WFSearch", "http.token")
+
+def token() -> str:
+    with open(TOKEN_PATH, encoding="utf-8") as f:
+        return f.read().strip()
 
 def search(q: str, limit: int = 20):
     url = "http://127.0.0.1:15100/api/v1/search?" + urllib.parse.urlencode({"q": q, "limit": limit})
-    with urllib.request.urlopen(url) as resp:
+    req = urllib.request.Request(url, headers={"x-wfs-token": token()})
+    with urllib.request.urlopen(req) as resp:
         return json.load(resp)
 ```
 
@@ -88,9 +99,13 @@ Console.WriteLine(resp.GetProperty("data").GetProperty("total_matched"));
 ## C# — HTTP
 
 ```csharp
+var token = (await File.ReadAllTextAsync(
+    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+        "WFSearch", "http.token"))).Trim();
+using var http = new HttpClient();
+http.DefaultRequestHeaders.Add("x-wfs-token", token);
 var url = "http://127.0.0.1:15100/api/v1/search?q=" + Uri.EscapeDataString("*.docx") + "&limit=20";
-var resp = await JsonSerializer.DeserializeAsync<JsonElement>(
-    await new HttpClient().GetStreamAsync(url));
+var resp = await JsonSerializer.DeserializeAsync<JsonElement>(await http.GetStreamAsync(url));
 ```
 
 ## Rust (wfs-client crate)
@@ -105,6 +120,10 @@ for f in &r.results { println!("{}", f.path); }
 
 // Match on path (replaces filename matching with whole-path matching; 5–10× slower)
 let r = c.search(&SearchReq { q: r"projects\2026".into(), match_path: true, ..Default::default() }).unwrap();
+
+// HTTP transport: load_token() reads <ProgramData>\WFSearch\http.token
+let token = wfs_client::load_token().unwrap();
+let r = wfs_client::search_http(&SearchReq { q: "*.md".into(), ..Default::default() }, 15100, &token).unwrap();
 ```
 
 Every `SearchReq` field except `q` has a default: `limit=100`, `offset=0`,
@@ -119,10 +138,12 @@ Every `SearchReq` field except `q` has a default: `limit=100`, `offset=0`,
 3. **Readiness**: the server listens as soon as it starts; clients should check
    `status` for `phase == "ready"` on the relevant volume before concluding "no results",
    so an unfinished index is not mistaken for an empty one.
-4. **Errors**: `{"type":"err","data":{"code":1|2|3,"message":...}}`; HTTP maps these to 4xx/5xx.
+4. **Errors**: `{"type":"err","data":{"code":1|2|3,"message":...}}`; HTTP maps these to
+   4xx/5xx. `code: 4` (missing or wrong token → `401`) exists on HTTP only.
 5. **Path matching**: terms containing `\` or `/` match on the path automatically; to put
    **all** terms on the path set `match_path=true` (Named Pipe) or `match_path=true` (HTTP
    query parameter). Keep it off for filename-only searches — it costs 5–10×.
-6. **Permissions**: with `pipe_acl = "restricted"` on the server, the pipe accepts only
-   SYSTEM + Administrators; non-admin clients get "access denied" and should switch to
-   HTTP (loopback only) or elevate.
+6. **Permissions**: `acl = "restricted"` tightens **both** channels — the pipe then accepts
+   only SYSTEM + Administrators (everyone else gets "access denied"), and `http.token` is
+   readable only by them, so HTTP yields 401 for the rest. Under the default `open`, anyone
+   signed in at the console can use both.

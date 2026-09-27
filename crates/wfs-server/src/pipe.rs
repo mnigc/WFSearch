@@ -15,7 +15,7 @@ const FRAME_LIMIT: u32 = 4 << 20; // 4MB request cap
 
 pub async fn spawn(state: Arc<AppState>) -> anyhow::Result<()> {
     let pipe_name = state.config.pipe_name.clone();
-    let restricted = state.config.pipe_acl_restricted();
+    let restricted = state.config.acl_restricted();
     let mut server = create_instance(&pipe_name, true, restricted)?;
     if restricted {
         tracing::info!("pipe: DACL restricted to SYSTEM + Administrators");
@@ -53,20 +53,27 @@ pub async fn spawn(state: Arc<AppState>) -> anyhow::Result<()> {
 }
 
 /// Create one pipe instance. `first` sets FILE_FLAG_FIRST_PIPE_INSTANCE so a
-/// second engine cannot take over the name; `restricted` passes a
-/// SYSTEM + Administrators DACL to `CreateNamedPipeW` (the handle is created
-/// with the DACL, so no separate `SetSecurityInfo` right is needed).
+/// second engine cannot take over the name.
 ///
-/// Synchronous on purpose: `PipeSecurity` holds a raw pointer and would make
-/// any future that awaits across it non-`Send`.
+/// The DACL is always explicit, including the `open` case: a pipe created
+/// without one inherits the *creating token's* default DACL, which serves the
+/// interactive user in console mode but not when the engine runs as a
+/// LocalSystem service. Passing `SDDL_OPEN` makes `acl = "open"` mean the same
+/// thing in both. The handle is created with the descriptor, so no separate
+/// `SetSecurityInfo` right is needed.
+///
+/// Synchronous on purpose: `SecurityDescriptor` holds a raw pointer and would
+/// make any future that awaits across it non-`Send`.
 fn create_instance(name: &str, first: bool, restricted: bool) -> std::io::Result<NamedPipeServer> {
     let mut opts = ServerOptions::new();
     opts.first_pipe_instance(first);
-    if !restricted {
-        return opts.create(name);
-    }
-    let mut sec = wfs_fs::sec::PipeSecurity::from_sddl(wfs_fs::sec::SDDL_ADMINS_ONLY)
-        .map_err(std::io::Error::other)?;
+    let sddl = if restricted {
+        wfs_fs::sec::SDDL_ADMINS_ONLY
+    } else {
+        wfs_fs::sec::SDDL_OPEN
+    };
+    let mut sec =
+        wfs_fs::sec::SecurityDescriptor::from_sddl(sddl).map_err(std::io::Error::other)?;
     unsafe { opts.create_with_security_attributes_raw(name, sec.as_raw()) }
 }
 
@@ -187,16 +194,36 @@ mod tests {
         assert_eq!(v["data"]["code"], ERR_BAD_REQUEST);
     }
 
+    /// The regression this guards: `acl = "open"` used to inherit the creating
+    /// token's default DACL, which served the interactive user in console mode
+    /// but locked every client out of a LocalSystem service. Since the tests run
+    /// as that same interactive user, inheritance was invisible to them — so
+    /// the DACL itself is read back and asserted.
     #[tokio::test]
-    async fn restricted_dacl_pipe_can_be_created() {
+    async fn open_dacl_grants_interactive_users() {
         let name = testutil::unique_pipe();
         // tokio's ServerOptions registers with the reactor, hence the async test.
-        // Exercises SDDL -> SECURITY_ATTRIBUTES -> CreateNamedPipeW. Whether a
-        // non-admin token may then connect depends on who runs the tests (CI is
-        // admin), so only creation is asserted here.
-        let inst = create_instance(&name, true, true).expect("restricted pipe instance");
+        let inst = create_instance(&name, true, false).expect("open pipe instance");
+        let sddl = wfs_fs::sec::pipe_sddl(&name).expect("read the pipe DACL back");
+        assert!(sddl.contains("(A;;"), "an allow ACE is expected: {sddl}");
+        assert!(sddl.contains("IU"), "open must grant IU: {sddl}");
         drop(inst);
-        // the name is free again once the instance is closed
-        create_instance(&name, true, false).expect("open pipe instance");
+    }
+
+    #[tokio::test]
+    async fn restricted_dacl_withholds_interactive_users() {
+        let name = testutil::unique_pipe();
+        let inst = create_instance(&name, true, true).expect("restricted pipe instance");
+        match wfs_fs::sec::pipe_sddl(&name) {
+            Ok(sddl) => assert!(!sddl.contains("IU"), "restricted must not grant IU: {sddl}"),
+            // The read-back is itself gated by the DACL: a UAC-filtered token has
+            // `BA` marked deny-only, so denial here is the restriction working.
+            // An elevated runner (CI) takes the `Ok` branch instead.
+            Err(e) => assert!(
+                e.to_string().ends_with("win32 error 5"),
+                "only access denied is acceptable: {e}"
+            ),
+        }
+        drop(inst);
     }
 }

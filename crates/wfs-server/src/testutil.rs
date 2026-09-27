@@ -52,7 +52,7 @@ pub fn unique_pipe() -> String {
 
 /// A ready engine with the fixture tree indexed, listening nowhere.
 pub fn state() -> Arc<AppState> {
-    let st = AppState::new(config_in(temp_dir("state")));
+    let st = AppState::try_new(config_in(temp_dir("state"))).expect("state");
     st.engine.init_volume(
         'C',
         fixture_index(),

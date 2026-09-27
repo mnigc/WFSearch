@@ -39,6 +39,34 @@ wfs-server.exe uninstall               # 卸载注册
 服务进程没有控制台,不落文件就什么也看不到。调试时可先 `console` 模式排查(日志到 stderr),
 或设置环境变量 `RUST_LOG=debug`。
 
+## 作为组件集成(由宿主软件更新 exe)
+
+发布渠道是 GitHub Releases:推一个 `v*` tag,CI 构建并把 `wfs-server.exe` 挂到 Release。
+宿主侧的固定下载地址(永远指向最新版):
+
+```
+https://github.com/mnigc/WFSearch/releases/latest/download/wfs-server.exe
+```
+
+更新一个 exe 分三步,顺序不能变:
+
+1. **停**:服务形态 `sc stop WFSearch` 并等待状态变为 STOPPED;子进程形态 `TerminateProcess`
+   后**必须等待进程真正退出**(.NET 的 `Process.Kill()` 是异步的,不等会撞上文件锁)。
+2. **换**:先把旧文件重命名为 `wfs-server.exe.old`——Windows 允许重命名**正在运行**的 exe,
+   所以即使第 1 步失败这一步也总能成功;然后把新 exe 放到原路径。
+3. **起**:`sc start WFSearch` 或重新 `CreateProcess`。快照机制保证重启是暖启动,不重建索引。
+
+宿主应在**下次启动时清理**残留的 `.old`(第 2 步改名后若立刻拉起新进程,旧文件当时删不掉)。
+
+集成契约——以下三条是对宿主(以及本项目后续版本)的承诺,破坏任何一条"替换一个文件"就不再成立:
+
+- **单一 exe、零外部 DLL**:不引入需要随包分发的原生依赖。
+- **数据目录固定在 `%ProgramData%\WFSearch\`**:与 exe 所在路径和文件名无关,换位置不丢索引。
+- **HTTP 协议与快照格式向后兼容**:宿主可能停留在旧版 exe;字段只增不改语义。
+
+走 HTTP 的宿主还要知道一点:**token 每次启动换发**,不要缓存 —— 拉起(或重启)引擎后重新读一次
+`%ProgramData%\WFSearch\http.token`。嫌麻烦就改用 named pipe,DACL 由操作系统鉴权,没有凭据要管。
+
 ## 真实磁盘验收
 
 管理员终端跑一次,拿到冷启动/查询延迟/变更可见延迟/暖启动/内存五项指标,并逐条对照 README 目标:
@@ -89,7 +117,8 @@ volume C:
 | 配置 | `%ProgramData%\WFSearch\config.toml` | 不存在则全默认;也可 `--config <FILE>` |
 | 快照 | `%ProgramData%\WFSearch\index.bin` | 索引 + journal 位置,原子写(tmp + rename) |
 | 服务日志 | `%ProgramData%\WFSearch\wfs.log` | 仅服务模式;>16MB 时轮转为 `.log.old` |
-| 自定义数据目录 | config 里 `data_dir = "D:\\wfsdata"` | 快照与日志都放这里 |
+| HTTP token | `%ProgramData%\WFSearch\http.token` | 启动时随机生成;HTTP 通道的凭据,DACL 跟着 `acl` 走 |
+| 自定义数据目录 | config 里 `data_dir = "D:\\wfsdata"` | 快照、日志与 token 都放这里 |
 
 首次启动:逐盘全量枚举(期间 `/status` 显示 `building` 与进度);构建完成自动落一次快照;之后每次优雅退出(服务停止 / Ctrl-C)都会刷新快照。重启时若 journal 未回绕则秒级恢复,否则该盘自动重建。
 
@@ -99,12 +128,18 @@ volume C:
 wfs-cli.exe search "*.docx"
 wfs-cli.exe search "report C: 2026" --limit 50 --sort name
 wfs-cli.exe search "src\core" --match-path         # 整条路径匹配
-wfs-cli.exe search "*.md" --http                     # 走 HTTP 通道
+wfs-cli.exe search "*.md" --http                     # 走 HTTP 通道(自己读 http.token)
+wfs-cli.exe search "*.md" --http --token <值>         # 数据目录非默认时手动给 token
 wfs-cli.exe status
 ```
 
-配置项里 `pipe_acl = "restricted"`(仅 SYSTEM + Administrators)会同时影响所有客户端:
-此模式下 wfs-cli 必须以管理员身份运行(HTTP 通道不受影响)。写错的值回退为 `open` 并在 stderr 告警。
+访问控制由 `acl` 一项管两个通道:`open`(默认)放行本机登录用户;`restricted` 只放行
+SYSTEM + Administrators —— 此时 wfs-cli 两种通道都要在管理员终端里跑,演示 UI 也只有管理员
+打得开(它读不到 token)。写错的值回退为 `open` 并在 stderr 告警。
+
+浏览器打开演示 UI:`http://127.0.0.1:15100/?token=<Get-Content $env:ProgramData\WFSearch\http.token>`
+(地址栏填不了请求头,所以首页认 `?token=`;页面自己发请求时改回头部)。不带 token 会看到一页
+中文说明,而不是搜索结果。
 
 ## 常见问题
 
@@ -112,8 +147,10 @@ wfs-cli.exe status
 |---|---|
 | `status` 里 volume `failed` | 先跑 `wfs-server.exe doctor <盘>`:它逐步报出是哪个 ioctl 失败、Win32 错误码是什么。原因通常是 console 模式没提权、盘不存在、或卷上 USN journal 不可用 |
 | 新文件搜不到 | 查询在 1s 内属正常窗口;若一直搜不到,先跑 `doctor`(看上一节的 `journal history`),再以 `RUST_LOG=info,wfs_server=debug,wfs_fs=debug` 起引擎:watch 循环每 15s 打一行 `journal at usn <n> - <polls> poll(s), <records> record(s) read so far`,有变化时打 `journal +N records -> M events`。位置不动或 `records > 0, events == 0` 即可判定是 journal 读取还是解析的问题 |
-| pipe 连接拒绝 | 服务未启动、`pipe_name` 配置不一致,或配置了 `pipe_acl = "restricted"` 而客户端非管理员 |
+| pipe 连接拒绝 | 服务未启动、`pipe_name` 配置不一致,或 `acl = "restricted"` 而客户端非管理员 |
 | pipe 启动即退出 | 同名的 pipe 已被占用(已有实例在跑):`--config` 换 `pipe_name`,或先停掉旧进程 |
+| HTTP 返回 401 / `code:4` | 没带 `x-wfs-token`,或 token 与数据目录里的 `http.token` 不一致(引擎重启会换发、`acl` 改过、`data_dir` 换过都会) |
+| HTTP 读不到 `http.token` | 该文件的 DACL 由 `acl` 决定,`restricted` 下非管理员进程读不到 —— 这正是收紧的开关,换管理员终端或改回 `open` |
 | HTTP 端口冲突 | 改 `http_port`;仅监听 127.0.0.1,不对局域网暴露 |
 | 内存增长 | 增删改产生墓碑,超过阈值(>1024 且 >5%)自动全量重建回收;可 `POST /api/v1/snapshot` 后手动重启加速回收 |
 | 服务日志在哪 | `%ProgramData%\WFSearch\wfs.log`(console 模式则直接打到 stderr) |

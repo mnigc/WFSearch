@@ -17,7 +17,7 @@ pub struct App {
 }
 
 pub fn boot(config: Config) -> anyhow::Result<App> {
-    let state = AppState::new(config);
+    let state = AppState::try_new(config)?;
 
     // warm start: restore whatever the snapshot can cover
     let resumed: HashMap<char, JournalPos> = snapshot::try_load(&state);

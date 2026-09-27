@@ -9,8 +9,13 @@
 | Named Pipe(推荐) | `\\.\pipe\wfs-engine-v1` | 4 字节小端长度 + JSON;请求/响应同构;连接可复用 |
 | HTTP(辅助) | `http://127.0.0.1:15100` | 标准 REST,见下 |
 
-单帧上限 4MB。管道 DACL 默认沿用 Windows 默认值(本机任意用户可连);配置
-`pipe_acl = "restricted"` 可收紧为仅 SYSTEM + Administrators(见 [deploy.md](deploy.md))。
+单帧上限 4MB。鉴权按通道各有一套,由配置项 `acl` 统一选择(见 [deploy.md](deploy.md)):
+
+* **Named Pipe**:凭 DACL,操作系统在连接时就完成鉴权。`open`(默认)放行本机登录用户,
+  `restricted` 仅 SYSTEM + Administrators。
+* **HTTP**:凭 bearer token。回环连接不携带用户身份,所以每个请求都要带
+  `x-wfs-token`,值取自数据目录下的 `http.token`;该文件的 DACL 跟着 `acl` 走 —— 读得到
+  文件就等于有凭证。
 
 ## Named Pipe
 
@@ -59,20 +64,26 @@
 
 `phase`:`building` | `ready` | `failed`。
 
-错误码:`1` 请求非法,`2` 未就绪,`3` 内部错误。
+错误码:`1` 请求非法,`2` 未就绪,`3` 内部错误,`4` token 缺失或不对(仅 HTTP:
+pipe 的连接本身带着 Windows 身份,`4` 不会出现在 pipe 上)。
 
 ## HTTP API(仅 127.0.0.1)
 
 ```
+GET /                          # 同源的演示 UI(浏览器需带 token,见下)
 GET /api/v1/search?q=<query>&limit=100&offset=0&sort=none&match_path=false
 GET /api/v1/status
 POST /api/v1/snapshot          # 手动落盘快照
 ```
 
+每个请求都要带 `x-wfs-token: <http.token 的内容>`。地址栏没法填请求头,所以打开演示 UI
+时用查询参数:`http://127.0.0.1:15100/?token=…`;页面加载后,它自己的 `fetch` 会改回头部。
+token 在服务启动时随机生成并写入数据目录的 `http.token`(权限按 `acl` 收紧)。
+
 `match_path` 接受 `1` / `true`(大小写不敏感),其余值视为 `false`。
 
 响应即上表 `data` 部分(SearchResp / StatusResp JSON),错误以对应 HTTP 状态码 + `ErrorPayload` 返回
-(空查询 `q` → `400` + code 1)。
+(空查询 `q` → `400` + code 1,token 不对 → `401` + code 4)。
 
 ## 帧示例(Python)
 

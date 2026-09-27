@@ -1,0 +1,368 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WFSearch · 搜索台</title>
+<style>
+  :root {
+    --bg: #0b0f14; --card: #121924; --card2: #0e141d; --line: #1f2a37;
+    --tx: #e6edf3; --tx2: #8b98a5; --tx3: #5c6a77;
+    --acc: #4cc2ff; --acc2: #0e6fc0; --ok: #3fb950; --warn: #d29922; --bad: #f85149;
+    --mono: Consolas, "Cascadia Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--tx);
+    font: 15px/1.55 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  }
+  main { max-width: 880px; margin: 0 auto; padding: 0 20px 40px; }
+  code { font-family: var(--mono); background: var(--card2); border: 1px solid var(--line);
+         border-radius: 4px; padding: 0 5px; font-size: .88em; color: var(--acc); }
+
+  /* ---------- header ---------- */
+  header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+           max-width: 880px; margin: 0 auto; padding: 22px 20px 14px; }
+  .brand { font-size: 21px; font-weight: 650; letter-spacing: .2px; display: flex;
+           align-items: center; gap: 9px; }
+  .chip { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px;
+          color: var(--tx2); background: var(--card); border: 1px solid var(--line);
+          border-radius: 999px; padding: 3px 11px; white-space: nowrap; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--tx3); flex: none; }
+  .dot.ready { background: var(--ok); }
+  .dot.building { background: var(--warn); animation: pulse 1.1s ease-in-out infinite; }
+  .dot.failed { background: var(--bad); }
+  @keyframes pulse { 50% { opacity: .25; } }
+  .chips { display: flex; gap: 8px; flex-wrap: wrap; margin-left: auto; }
+
+  /* ---------- search card ---------- */
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; }
+  .searchbox { padding: 16px; margin-top: 4px; }
+  .srow { display: flex; gap: 10px; }
+  #q { flex: 1; height: 46px; padding: 0 15px; font-size: 16px; color: var(--tx);
+       background: var(--card2); border: 1px solid var(--line); border-radius: 9px;
+       outline: none; transition: border-color .15s, box-shadow .15s; }
+  #q::placeholder { color: var(--tx3); }
+  #q:focus { border-color: var(--acc2); box-shadow: 0 0 0 3px #0e6fc040; }
+  #go { height: 46px; padding: 0 22px; font-size: 15px; font-weight: 600; color: #fff;
+        background: linear-gradient(180deg, #1a84dd, #0e6fc0); border: none;
+        border-radius: 9px; cursor: pointer; }
+  #go:hover { filter: brightness(1.12); }
+  #go:active { transform: translateY(1px); }
+  .opts { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; margin-top: 12px;
+          font-size: 13.5px; color: var(--tx2); }
+  .opts label { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+  .opts select { color: var(--tx); background: var(--card2); border: 1px solid var(--line);
+                 border-radius: 6px; padding: 3px 6px; font-size: 13px; outline: none; }
+  .busy { color: var(--acc); }
+  .hint { margin-top: 12px; font-size: 12.5px; color: var(--tx3); }
+  .hidden { display: none !important; }
+
+  /* ---------- banner / state ---------- */
+  .banner { margin-top: 14px; padding: 10px 15px; border-radius: 10px; font-size: 13.5px;
+            border: 1px solid; }
+  .banner.warn { color: #e3b341; background: #d2992212; border-color: #d2992255; }
+  .banner.bad { color: #ff7b72; background: #f8514910; border-color: #f8514944; }
+  .state { margin-top: 14px; padding: 34px 20px; text-align: center; color: var(--tx2); }
+  .state .big { font-size: 34px; display: block; margin-bottom: 10px; }
+  .state .cmd { display: inline-block; margin-top: 10px; font-family: var(--mono);
+                font-size: 13px; color: var(--acc); background: var(--card2);
+                border: 1px solid var(--line); border-radius: 8px; padding: 7px 13px;
+                user-select: all; }
+
+  /* ---------- meta / pager ---------- */
+  .meta { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+          margin: 18px 2px 10px; font-size: 13.5px; color: var(--tx2); }
+  .meta b { color: var(--tx); font-weight: 650; }
+  .meta .lat { color: var(--tx3); }
+  .pager { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; }
+  .pager button { height: 28px; padding: 0 12px; color: var(--tx); background: var(--card);
+                  border: 1px solid var(--line); border-radius: 7px; cursor: pointer;
+                  font-size: 12.5px; }
+  .pager button:hover:not(:disabled) { border-color: var(--acc2); color: var(--acc); }
+  .pager button:disabled { opacity: .38; cursor: default; }
+
+  /* ---------- results ---------- */
+  .results { list-style: none; margin: 0; padding: 0; border: 1px solid var(--line);
+             border-radius: 12px; overflow: hidden; }
+  .results li { display: flex; align-items: center; gap: 11px; padding: 9px 14px;
+                background: var(--card); border-top: 1px solid var(--line); }
+  .results li:first-child { border-top: none; }
+  .results li:hover { background: #16202e; }
+  .ico { flex: none; width: 20px; text-align: center; }
+  .fmain { flex: 1; min-width: 0; }
+  .fname { font-size: 14.5px; word-break: break-all; }
+  .fpath { font-family: var(--mono); font-size: 12px; color: var(--tx2);
+           word-break: break-all; }
+  mark { background: #0078d445; color: #bfe3ff; border-radius: 3px; padding: 0 1px; }
+  .copy { flex: none; height: 26px; padding: 0 10px; font-size: 12px; color: var(--tx2);
+          background: var(--card2); border: 1px solid var(--line); border-radius: 6px;
+          cursor: pointer; }
+  .copy:hover { color: var(--acc); border-color: var(--acc2); }
+
+  footer { max-width: 880px; margin: 26px auto 0; padding: 14px 20px 0;
+           border-top: 1px solid var(--line); font-size: 12.5px; color: var(--tx3); }
+  .ex { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+        font-size: 12.5px; color: var(--tx3); }
+  .ex button { font-family: var(--mono); font-size: 12px; color: var(--acc);
+               background: var(--card2); border: 1px solid var(--line);
+               border-radius: 999px; padding: 3px 11px; cursor: pointer; }
+  .ex button:hover { border-color: var(--acc2); }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">🔍 WFSearch</div>
+  <div class="chips" id="chips"><span class="chip"><span class="dot"></span>连接中…</span></div>
+</header>
+
+<main>
+  <section class="card searchbox">
+    <div class="srow">
+      <input id="q" autofocus autocomplete="off" spellcheck="false"
+             placeholder="搜索文件名,如:report *.docx,或按路径:src\core">
+      <button id="go">搜索</button>
+    </div>
+    <div class="opts">
+      <label><input type="checkbox" id="mp"> 按路径匹配(慢 5–10×)</label>
+      <label>排序
+        <select id="sort">
+          <option value="none">索引序(最快)</option>
+          <option value="name">名称</option>
+          <option value="path">路径</option>
+        </select>
+      </label>
+      <label>每页
+        <select id="limit">
+          <option>20</option><option selected>50</option><option>100</option>
+          <option>200</option><option>500</option><option>1000</option>
+        </select>
+      </label>
+      <span id="busy" class="busy hidden">查询中…</span>
+    </div>
+    <div class="hint">
+      空格 = 多词 AND · <code>*</code> / <code>?</code> 通配符 · 词含 <code>\</code> 或 <code>/</code>
+      自动按路径匹配 · 词首 <code>C:</code> 过滤盘符 · 大小写 / Unicode 折叠
+    </div>
+    <div class="ex">试试:
+      <button data-q="*.rs">*.rs</button>
+      <button data-q="*.docx">*.docx</button>
+      <button data-q="C: report">C: report</button>
+      <button data-q="src\core">src\core</button>
+    </div>
+  </section>
+
+  <div id="banner"></div>
+
+  <section id="meta" class="meta hidden">
+    <span id="count"></span>
+    <span id="lat" class="lat"></span>
+    <span class="pager">
+      <button id="prev">‹ 上一页</button>
+      <span id="page"></span>
+      <button id="next">下一页 ›</button>
+    </span>
+  </section>
+
+  <ul id="results" class="results hidden"></ul>
+  <section id="state" class="card state hidden"></section>
+</main>
+
+<footer>engine <span id="fver">—</span> · 协议 v<span id="fproto">—</span> ·
+  <span id="fuptime"></span> · HTTP 仅绑定本机回环</footer>
+
+<script>
+'use strict';
+const $ = s => document.querySelector(s);
+let offset = 0, total = 0, pageLimit = 50, inflight = 0, debounce = null, online = null;
+// The gateway authenticates HTTP with a bearer token (loopback carries no user
+// identity); it arrives in the URL because a browser cannot set a header on the
+// address bar.
+const TOKEN = new URLSearchParams(location.search).get('token') || '';
+// Drop it from the URL right away: it is already held here, and leaving it in
+// the address bar puts it in the browsing history and any bookmark.
+if (TOKEN) history.replaceState(null, '', location.pathname + location.hash);
+
+const esc = s => s.replace(/[&<>"']/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const escRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const fmt = n => n.toLocaleString();
+const fmtMB = b => (b / 1048576).toFixed(1) + ' MB';
+const PHASE = { ready: ['就绪', 'dot ready'], building: ['构建中', 'dot building'],
+                failed: ['失败', 'dot failed'] };
+
+function human(ms) {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return s + ' 秒';
+  if (s < 3600) return Math.floor(s / 60) + ' 分钟';
+  if (s < 86400) return Math.floor(s / 3600) + ' 小时 ' + Math.floor(s % 3600 / 60) + ' 分';
+  return Math.floor(s / 86400) + ' 天 ' + Math.floor(s % 86400 / 3600) + ' 小时';
+}
+
+async function api(path) {
+  let r;
+  try { r = await fetch(path, { headers: { 'x-wfs-token': TOKEN } }); }
+  catch { throw Object.assign(new Error('connect'), { connect: true }); }
+  const j = await r.json().catch(() => null);
+  if (r.status === 401) throw Object.assign(new Error('unauthorized'), { auth: true });
+  if (!r.ok) throw new Error(j && j.message ? j.message : 'HTTP ' + r.status);
+  return j;
+}
+
+/* ---------- status ---------- */
+async function refreshStatus() {
+  try {
+    const st = await api('/api/v1/status');
+    setOnline(true);
+    $('#fver').textContent = st.version;
+    $('#fproto').textContent = st.protocol;
+    $('#fuptime').textContent = '已运行 ' + human(st.uptime_ms);
+    $('#chips').innerHTML =
+      st.volumes.map(v => {
+        const [txt, cls] = PHASE[v.phase] || [v.phase, ''];
+        const files = v.phase === 'ready' ? ' · ' + fmt(v.files) + ' 项' : '';
+        return `<span class="chip"><span class="dot ${cls}"></span>${esc(v.drive)}: ${txt}${files}</span>`;
+      }).join('') +
+      `<span class="chip">内存 ${fmtMB(st.approx_memory_bytes)}</span>`;
+    $('#banner').innerHTML = st.volumes.filter(v => v.phase !== 'ready').map(v => {
+      if (v.phase === 'building')
+        return `<div class="banner warn">⏳ 卷 ${esc(v.drive)}: 索引构建中,MFT 全量枚举完成后结果逐步可用。</div>`;
+      return `<div class="banner bad">⛔ 卷 ${esc(v.drive)}: 索引失败 — 最常见原因是权限不足
+        (MFT/USN 访问需要管理员或 LocalSystem)。可用 <code>wfs-server.exe doctor ${esc(v.drive)}</code> 逐步排查。</div>`;
+    }).join('');
+  } catch (e) {
+    if (e && e.auth) { renderAuth(); return; }
+    setOnline(false);
+  }
+}
+function setOnline(ok) {
+  if (online === ok) { if (!ok) renderOffline(); return; }
+  online = ok;
+  if (!ok) renderOffline();
+}
+function renderOffline() {
+  $('#chips').innerHTML = '<span class="chip"><span class="dot"></span>引擎未连接</span>';
+  $('#banner').innerHTML =
+    `<div class="banner bad">🔌 连不上引擎(127.0.0.1 的 HTTP 未监听)。在管理员终端启动:
+     <div style="margin-top:6px"><span class="cmd">cargo run --release -p wfs-server -- console</span></div>
+     或安装为服务:<span class="cmd">wfs-server.exe install</span>,然后刷新本页。</div>`;
+  $('#fuptime').textContent = '';
+}
+function renderAuth() {
+  $('#chips').innerHTML = '<span class="chip"><span class="dot"></span>token 无效</span>';
+  $('#banner').innerHTML =
+    `<div class="banner bad">🔒 token 不对或已失效 —— 引擎每次启动换发一个。重新用
+     <code>?token=&lt;http.token 的内容&gt;</code> 打开本页(文件在数据目录下,
+     权限由 <code>acl</code> 决定)。</div>`;
+}
+
+/* ---------- search ---------- */
+function tokens() {
+  return $('#q').value.trim().split(/\s+/)
+    .map(w => w.replace(/[*?]/g, '')).filter(w => w.length > 0);
+}
+function hi(name) {
+  let out = esc(name);
+  for (const t of tokens()) {
+    out = out.replace(new RegExp(escRe(esc(t)), 'gi'), m => '<mark>' + m + '</mark>');
+  }
+  return out;
+}
+function query() {
+  const p = new URLSearchParams();
+  p.set('q', $('#q').value.trim());
+  p.set('limit', pageLimit);
+  p.set('offset', offset);
+  p.set('sort', $('#sort').value);
+  if ($('#mp').checked) p.set('match_path', '1');
+  return p.toString();
+}
+async function run() {
+  const q = $('#q').value.trim();
+  if (!q) { idle(); return; }
+  inflight++; $('#busy').classList.remove('hidden');
+  const t0 = performance.now();
+  try {
+    const r = await api('/api/v1/search?' + query());
+    const rt = performance.now() - t0;
+    total = r.total_matched;
+    render(r, rt);
+    history.replaceState(null, '', '#q=' + encodeURIComponent(q));
+  } catch (e) {
+    if (e.connect) { setOnline(false); return; }
+    if (e.auth) { renderAuth(); return; }
+    fail(e.message);
+  } finally {
+    inflight--; if (!inflight) $('#busy').classList.add('hidden');
+  }
+}
+function show(el) { [$('#meta'), $('#results'), $('#state')].forEach(x => x.classList.add('hidden'));
+  if (el) el.classList.remove('hidden'); }
+function idle() {
+  show($('#state'));
+  $('#state').innerHTML = '<span class="big">🔎</span>输入查询即时出结果 — 引擎 P99 ≈ 10 ms,百万文件毫秒级返回。';
+}
+function fail(msg) {
+  show($('#state'));
+  $('#state').innerHTML = '<span class="big">⚠️</span>' + esc(msg);
+}
+function render(r, rt) {
+  if (r.results.length === 0) {
+    show($('#state'));
+    $('#state').innerHTML = '<span class="big">🫙</span>没有匹配的文件。<br>' +
+      '<span style="font-size:13px">试试加通配符(<code>*.docx</code>),或改用路径匹配(<code>src\\core</code>)。</span>';
+    return;
+  }
+  show($('#results'));
+  $('#results').innerHTML = r.results.map(f =>
+    `<li><span class="ico">${f.is_dir ? '📁' : '📄'}</span>` +
+    `<span class="fmain"><div class="fname">${hi(f.name)}</div>` +
+    `<div class="fpath">${esc(f.path)}</div></span>` +
+    `<button class="copy" data-p="${esc(f.path)}">复制路径</button></li>`).join('');
+  $('#count').innerHTML = '共 <b>' + fmt(total) + '</b> 个匹配';
+  $('#lat').textContent =
+    `引擎 ${r.query_ms} ms · 往返 ${rt.toFixed(0)} ms`;
+  $('#meta').classList.remove('hidden');
+  const lo = offset + 1, hiN = offset + r.results.length;
+  $('#page').textContent = fmt(lo) + '–' + fmt(hiN) + ' / ' + fmt(total);
+  $('#prev').disabled = offset === 0;
+  $('#next').disabled = hiN >= total;
+}
+function rerun() { offset = 0; run(); }
+
+/* ---------- events ---------- */
+$('#q').addEventListener('input', () => {
+  clearTimeout(debounce);
+  debounce = setTimeout(rerun, 250);
+});
+$('#q').addEventListener('keydown', e => { if (e.key === 'Enter') { clearTimeout(debounce); rerun(); } });
+$('#go').addEventListener('click', rerun);
+for (const id of ['mp', 'sort', 'limit']) {
+  $(('#' + id)).addEventListener('change', () => { pageLimit = +$('#limit').value; rerun(); });
+}
+$('#prev').addEventListener('click', () => { offset = Math.max(0, offset - pageLimit); run(); });
+$('#next').addEventListener('click', () => { offset = offset + pageLimit; run(); });
+document.querySelectorAll('.ex button').forEach(b =>
+  b.addEventListener('click', () => { $('#q').value = b.dataset.q; rerun(); }));
+$('#results').addEventListener('click', e => {
+  const b = e.target.closest('.copy');
+  if (!b) return;
+  navigator.clipboard.writeText(b.dataset.p).then(() => {
+    b.textContent = '已复制 ✓';
+    setTimeout(() => { b.textContent = '复制路径'; }, 900);
+  });
+});
+window.addEventListener('hashchange', () => {
+  const q = decodeURIComponent(location.hash.replace(/^#q=/, ''));
+  if (q && q !== $('#q').value) { $('#q').value = q; rerun(); }
+});
+
+/* ---------- boot ---------- */
+const initial = decodeURIComponent(location.hash.replace(/^#q=/, ''));
+if (initial) { $('#q').value = initial; run(); } else { idle(); }
+refreshStatus();
+setInterval(refreshStatus, 3000);
+</script>
+</body>
+</html>

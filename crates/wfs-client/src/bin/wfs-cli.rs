@@ -19,6 +19,18 @@ struct Cli {
     /// use the HTTP transport instead of the named pipe
     #[arg(long, global = true)]
     http: bool,
+    /// HTTP bearer token (default: read <ProgramData>\WFSearch\http.token)
+    #[arg(long, global = true)]
+    token: Option<String>,
+}
+
+/// The token is only needed by the HTTP transport; the pipe is authenticated by
+/// its DACL, so there is nothing to present there.
+fn http_token(cli: &Cli) -> anyhow::Result<String> {
+    match &cli.token {
+        Some(t) => Ok(t.clone()),
+        None => wfs_client::load_token().map_err(|e| anyhow::anyhow!("{e}")),
+    }
 }
 
 #[derive(Subcommand)]
@@ -61,10 +73,10 @@ fn main() -> anyhow::Result<()> {
                 match_path: *match_path,
             };
             let resp = if cli.http {
-                wfs_client::search_http(&req, cli.port)?
+                wfs_client::search_http(&req, cli.port, &http_token(&cli)?)?
             } else {
                 Client::connect(&cli.pipe)
-                    .map_err(|e| anyhow::anyhow!("connect: {e}"))?
+                    .map_err(|e| anyhow::anyhow!("connect {}: {e}", cli.pipe))?
                     .search(&req)?
             };
             println!(
@@ -80,10 +92,10 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Status => {
             let resp = if cli.http {
-                wfs_client::status_http(cli.port)?
+                wfs_client::status_http(cli.port, &http_token(&cli)?)?
             } else {
                 Client::connect(&cli.pipe)
-                    .map_err(|e| anyhow::anyhow!("connect: {e}"))?
+                    .map_err(|e| anyhow::anyhow!("connect {}: {e}", cli.pipe))?
                     .status()?
             };
             println!("{}", serde_json::to_string_pretty(&resp)?);

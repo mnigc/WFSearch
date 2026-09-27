@@ -72,13 +72,18 @@ function Get-FreePort {
 
 # Raw loopback HTTP: no proxy, no TLS, no chunking -- mirrors wfs-client and the
 # Python/C# samples, so the probe measures the engine and not .NET's networking.
+# The gateway authenticates with a bearer token the engine publishes in its data
+# dir; it is re-issued at every start and this script restarts the engine, so it
+# is read per call rather than cached.
 function Get-Http {
     param([int]$Port, [string]$Path)
+    $tokenPath = Join-Path $script:DataDir 'http.token'
+    $token = if (Test-Path -LiteralPath $tokenPath) { (Get-Content -LiteralPath $tokenPath -Raw).Trim() } else { '' }
     $client = New-Object System.Net.Sockets.TcpClient
     try {
         $client.Connect('127.0.0.1', $Port)
         $stream = $client.GetStream()
-        $bytes = [System.Text.Encoding]::ASCII.GetBytes("GET $Path HTTP/1.0`r`nHost: 127.0.0.1`r`n`r`n")
+        $bytes = [System.Text.Encoding]::ASCII.GetBytes("GET $Path HTTP/1.0`r`nHost: 127.0.0.1`r`nx-wfs-token: $token`r`n`r`n")
         $stream.Write($bytes, 0, $bytes.Length)
         $stream.Flush()
         $reader = New-Object System.IO.StreamReader($stream)
@@ -225,6 +230,7 @@ function Format-Mb { param([double]$Bytes) return ('{0:N1} MB' -f ($Bytes / 1MB)
 
 $port = Get-FreePort
 $dataDir = Join-Path $env:TEMP ('wfs-accept-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+$script:DataDir = $dataDir
 New-Item -ItemType Directory -Path $dataDir | Out-Null
 $configPath = Join-Path $dataDir 'config.toml'
 $tomlDir = $dataDir -replace '\\', '\\'

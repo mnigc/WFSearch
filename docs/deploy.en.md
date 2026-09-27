@@ -41,6 +41,41 @@ at startup past 16 MB) — a service process has no console, and without a log f
 nothing at all. For debugging, reproduce in `console` mode first (logs go to stderr), or
 set `RUST_LOG=debug`.
 
+## Embedding as a component (host app updates the exe)
+
+The release channel is GitHub Releases: push a `v*` tag and CI builds `wfs-server.exe` and
+attaches it to the Release. The stable download URL for the host app (always the latest):
+
+```
+https://github.com/mnigc/WFSearch/releases/latest/download/wfs-server.exe
+```
+
+Replacing one exe is three steps, in this order:
+
+1. **Stop**: for the service, `sc stop WFSearch` and wait until the state is STOPPED; for a
+   child process, `TerminateProcess` and **wait for it to actually exit** (.NET's
+   `Process.Kill()` is asynchronous — not waiting hits the file lock).
+2. **Swap**: rename the old file to `wfs-server.exe.old` first — Windows allows renaming a
+   **running** exe, so this step succeeds even if step 1 failed — then put the new exe at the
+   original path.
+3. **Start**: `sc start WFSearch` or `CreateProcess` again. Snapshots make the restart warm;
+   no reindex.
+
+The host should **delete leftover `.old` files on next launch** (a renamed file cannot be
+removed while the old process still holds it).
+
+The integration contract — breaking any of these three invalidates "replace one file":
+
+- **Single exe, zero external DLLs**: never add a native dependency that must ship alongside.
+- **Data directory fixed at `%ProgramData%\WFSearch\`**: independent of the exe's path and
+  name, so moving the exe never loses the index.
+- **Backward-compatible HTTP protocol and snapshot format**: a host may stay on an older exe;
+  fields may be added, never redefined.
+
+A host on HTTP must also know: **the token is re-issued at every start**, so do not cache it —
+re-read `%ProgramData%\WFSearch\http.token` after (re)launching the engine. Or move to the
+named pipe, where the DACL authenticates and there is no credential to manage.
+
 ## Real-disk acceptance
 
 Run once in an elevated terminal to get cold start / query latency / change visibility /
@@ -101,7 +136,8 @@ replay. These two lines are diagnostic only and never affect the exit code.
 | Config | `%ProgramData%\WFSearch\config.toml` | all defaults when absent; or `--config <FILE>` |
 | Snapshot | `%ProgramData%\WFSearch\index.bin` | index + journal position, written atomically (tmp + rename) |
 | Service log | `%ProgramData%\WFSearch\wfs.log` | service mode only; rotated to `.log.old` past 16 MB |
-| Custom data dir | `data_dir = "D:\\wfsdata"` in config | hosts both snapshot and log |
+| HTTP token | `%ProgramData%\WFSearch\http.token` | generated at startup; the HTTP credential, its DACL follows `acl` |
+| Custom data dir | `data_dir = "D:\\wfsdata"` in config | hosts the snapshot, the log and the token |
 
 First start: a full enumeration per drive (while it runs, `/status` shows `building` plus
 progress); a snapshot is written automatically once the build finishes, and every graceful
@@ -114,13 +150,20 @@ has not wrapped recovers in seconds; otherwise it rebuilds automatically.
 wfs-cli.exe search "*.docx"
 wfs-cli.exe search "report C: 2026" --limit 50 --sort name
 wfs-cli.exe search "src\core" --match-path         # whole-path matching
-wfs-cli.exe search "*.md" --http                     # via the HTTP channel
+wfs-cli.exe search "*.md" --http                     # via the HTTP channel (loads http.token)
+wfs-cli.exe search "*.md" --http --token <value>     # when the data dir is not the default
 wfs-cli.exe status
 ```
 
-`pipe_acl = "restricted"` (SYSTEM + Administrators only) affects every pipe client:
-in that mode wfs-cli must run elevated (the HTTP channel is unaffected). An invalid value
-falls back to `open` with a stderr warning.
+Access control is the single `acl` key, and it covers **both** channels: `open` (default)
+admits anyone signed in at the console, `restricted` admits only SYSTEM + Administrators — in
+which case wfs-cli needs an elevated terminal on either transport, and the demo UI is
+reachable only by an admin (it cannot read the token). An invalid value falls back to `open`
+with a stderr warning.
+
+Demo UI in a browser: `http://127.0.0.1:15100/?token=<Get-Content $env:ProgramData\WFSearch\http.token>`
+(an address bar cannot set a header, so `/` accepts `?token=`; the page's own requests use the
+header). Without a token you get a page explaining where the token lives, not results.
 
 ## Troubleshooting
 
@@ -128,8 +171,10 @@ falls back to `open` with a stderr warning.
 |---|---|
 | volume shows `failed` in `status` | Run `wfs-server.exe doctor <drive>` first: it reports which ioctl failed and the Win32 error code. Usual causes: console mode not elevated, drive absent, or the volume's USN journal being unusable |
 | New files never show up | Within 1 s is the normal window; if it persists, run `doctor` (see `journal history` above), then start the engine with `RUST_LOG=info,wfs_server=debug,wfs_fs=debug`: the watch loop logs `journal at usn <n> - <polls> poll(s), <records> record(s) read so far` every 15 s and `journal +N records -> M events` on changes. A position that never moves, or `records > 0, events == 0`, pinpoints journal-read vs parsing |
-| Pipe connection refused | Service not running, `pipe_name` mismatch, or `pipe_acl = "restricted"` with a non-admin client |
+| Pipe connection refused | Service not running, `pipe_name` mismatch, or `acl = "restricted"` with a non-admin client |
 | Pipe exits immediately | The name is taken (an instance is already running): change `pipe_name` via `--config`, or stop the old process first |
+| HTTP replies 401 / `code:4` | No `x-wfs-token`, or a token that no longer matches `http.token` (a restart re-issues it, `acl` changed, `data_dir` moved) |
+| `http.token` is unreadable | Its DACL is set by `acl`; under `restricted` a non-admin process cannot read it — that is the restriction working. Use an elevated terminal or go back to `open` |
 | HTTP port conflict | Change `http_port`; it binds 127.0.0.1 only and is never exposed to the LAN |
 | Memory growth | Deletes create tombstones; past the threshold (>1024 and >5%) a full rebuild reclaims them automatically. `POST /api/v1/snapshot` plus a manual restart speeds up reclamation |
 | Where is the service log | `%ProgramData%\WFSearch\wfs.log` (console mode writes to stderr instead) |

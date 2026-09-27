@@ -2,6 +2,8 @@
 
 # 🔍 WFSearch
 
+**Windows Flash Search**
+
 **Blazing-fast filename search for Windows.**
 
 *The whole NTFS MFT indexed in memory — live USN Journal updates — queried over Named Pipe & local HTTP.*
@@ -52,9 +54,10 @@ cargo run --release -p wfs-server -- console
 
 # 2️⃣ Query from another terminal
 cargo run --release -p wfs-client -- search "*.rs"     # named pipe
-cargo run --release -p wfs-client -- status --http     # HTTP channel
+cargo run --release -p wfs-client -- status --http     # HTTP channel (loads the token itself)
 cargo run --release -p wfs-client -- search "src\core" --match-path   # match on path
-curl "http://127.0.0.1:15100/api/v1/search?q=report&limit=10"
+$tok = Get-Content "$env:ProgramData\WFSearch\http.token"
+curl "http://127.0.0.1:15100/api/v1/search?q=report&limit=10" -H "x-wfs-token: $tok"
 
 # 3️⃣ Install as a Windows service (elevated)
 wfs-server.exe install
@@ -139,13 +142,15 @@ http_port = 15100          # binds 127.0.0.1 only
 pipe_name = "\\\\.\\pipe\\wfs-engine-v1"
 poll_ms = 100              # journal poll interval
 max_limit = 1000           # per-query limit cap
-pipe_acl = "open"          # pipe DACL: open (default) | restricted (SYSTEM + admins)
+acl = "open"               # who may reach the engine: open (default) | restricted
 ```
 
-> 💡 `pipe_acl = "restricted"` limits *pipe* queries to SYSTEM + Administrators; an invalid
-> value falls back to `open` with a loud warning — never a silent downgrade. The pipe ACL
-> does **not** constrain the HTTP channel: HTTP binds the loopback only, but any local user
-> can reach it, so tightening access fully means considering both channels.
+> 💡 `acl = "restricted"` limits **both** channels to SYSTEM + Administrators. `open` means
+> anyone signed in at the console. An invalid value falls back to `open` with a loud warning —
+> never a silent downgrade. The pipe authenticates through its DACL (the OS does it for free);
+> HTTP authenticates with a bearer token published to `%ProgramData%\WFSearch\http.token`,
+> because a loopback connection carries no user identity. Reading that file *is* the
+> credential, and `acl` is what gates it.
 
 ## 📚 Documentation
 

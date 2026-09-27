@@ -1,8 +1,11 @@
 //! WFSearch client SDK — the reference implementation for embedding
 //! applications. Two transports, identical payloads:
 //!
-//! * named pipe (default, lowest latency): 4-byte LE length prefix + JSON
-//! * local HTTP: `GET /api/v1/search?q=...` on 127.0.0.1
+//! * named pipe (default, lowest latency): 4-byte LE length prefix + JSON.
+//!   Access control is the pipe DACL, so the OS authenticates you for free.
+//! * local HTTP: `GET /api/v1/search?q=...` on 127.0.0.1, plus the bearer
+//!   token from `<data dir>\http.token` in the `x-wfs-token` header. Loopback
+//!   carries no user identity, so the token is what gates this channel.
 //!
 //! See `docs/clients.md` for Python / C# equivalents.
 
@@ -104,10 +107,15 @@ fn urlencode(s: &str) -> String {
     out
 }
 
-fn http_get(port: u16, path: &str) -> Result<Vec<u8>> {
+fn http_get(port: u16, path: &str, token: &str) -> Result<Vec<u8>> {
     let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).map_err(io)?;
     // HTTP/1.0: no chunked encoding, body ends with the connection
-    write!(s, "GET {path} HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n").map_err(io)?;
+    write!(
+        s,
+        "GET {path} HTTP/1.0\r\nHost: 127.0.0.1\r\n{}: {token}\r\n\r\n",
+        TOKEN_HEADER
+    )
+    .map_err(io)?;
     let mut raw = Vec::new();
     s.read_to_end(&mut raw).map_err(io)?;
     let pos = raw
@@ -118,7 +126,31 @@ fn http_get(port: u16, path: &str) -> Result<Vec<u8>> {
     Ok(raw[pos..].to_vec())
 }
 
-pub fn search_http(req: &SearchReq, port: u16) -> Result<SearchResp> {
+/// Header the HTTP gateway demands; mirrors `wfs_server::http::TOKEN_HEADER`.
+pub const TOKEN_HEADER: &str = "x-wfs-token";
+
+/// `<data dir>\http.token`, where the engine publishes the HTTP bearer token.
+pub fn default_token_path() -> std::path::PathBuf {
+    std::env::var("ProgramData")
+        .map(|p| std::path::PathBuf::from(p).join("WFSearch"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join("http.token")
+}
+
+/// Read the HTTP bearer token. Only users the engine's `acl` admits can do
+/// this — the file's DACL *is* the credential.
+pub fn load_token() -> Result<String> {
+    let path = default_token_path();
+    let text = std::fs::read_to_string(&path).map_err(|e| {
+        ClientError(format!(
+            "read {}: {e} (engine running with acl=restricted, or not started?)",
+            path.display()
+        ))
+    })?;
+    Ok(text.trim().to_string())
+}
+
+pub fn search_http(req: &SearchReq, port: u16, token: &str) -> Result<SearchResp> {
     let sort = match req.sort {
         SortKind::None => "none",
         SortKind::Name => "name",
@@ -135,15 +167,15 @@ pub fn search_http(req: &SearchReq, port: u16) -> Result<SearchResp> {
             ""
         }
     );
-    let body = http_get(port, &path)?;
+    let body = http_get(port, &path, token)?;
     match serde_json::from_slice(&body) {
         Ok(r) => Ok(r),
         Err(e) => err(e.to_string()),
     }
 }
 
-pub fn status_http(port: u16) -> Result<StatusResp> {
-    let body = http_get(port, "/api/v1/status")?;
+pub fn status_http(port: u16, token: &str) -> Result<StatusResp> {
+    let body = http_get(port, "/api/v1/status", token)?;
     match serde_json::from_slice(&body) {
         Ok(r) => Ok(r),
         Err(e) => err(e.to_string()),
