@@ -1,0 +1,33 @@
+name: Release
+
+# Push a `v*` tag (e.g. `v0.1.1`) to publish `wfs-server.exe` / `wfs-cli.exe`
+# as GitHub Release assets. Integrators then swap a single file via:
+#   https://github.com/mnigc/WFSearch/releases/latest/download/wfs-server.exe
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    permissions:
+      contents: write # create the release + upload assets
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: build (release)
+        run: cargo build --workspace --release
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/release/wfs-server.exe
+            target/release/wfs-cli.exe
