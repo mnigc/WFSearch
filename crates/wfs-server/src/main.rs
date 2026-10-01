@@ -7,6 +7,7 @@
 mod api;
 mod app;
 mod config;
+mod content;
 mod http;
 mod pipe;
 mod service;
@@ -355,9 +356,23 @@ fn repl(state: &Arc<AppState>) {
                             r.query_ms,
                             r.results.len()
                         );
+                        if let Some(c) = &r.content {
+                            if c.truncated {
+                                println!("  note: candidate window exhausted — narrow the name terms for full coverage");
+                            }
+                            if c.timed_out {
+                                println!("  note: scan budget ran out — results are partial");
+                            }
+                        }
                         for f in &r.results {
                             let tag = if f.is_dir { " [DIR]" } else { "" };
                             println!("  {}{tag}", f.path);
+                            if let Some(sn) = &f.snippet {
+                                println!(
+                                    "      {sn}  ({} in file)",
+                                    f.content_matches.unwrap_or(0)
+                                );
+                            }
                         }
                     }
                     Err((_, m)) => println!("error: {m}"),

@@ -22,13 +22,19 @@ English · [中文](README.zh.md)
 ## ✨ Highlights
 
 - ⚡ **Millisecond queries** — substring + `*`/`?` wildcards over a million files at P99 ≈ 10 ms, case-insensitive with Unicode folding (CJK included)
+- 📄 **Document content search** — `content:` terms scan candidate files live: plain text (UTF-8/UTF-16) plus Office/ODF XML containers, snippets back per hit, zero index on disk
 - 🗂️ **Full-volume index in seconds** — reads the NTFS MFT directly; 1.25 M files in ~2 s
 - 🔄 **Live updates** — USN Journal polled every 100 ms, changes visible in < 100 ms; automatic full rebuild on journal wrap
 - 🪶 **Tiny footprint** — ≈ 87 bytes per file (~103 MB for 1.25 M entries), ~0% idle CPU
 - 🔌 **Two transports, one protocol** — Named Pipe for lowest latency, loopback HTTP for scripts & web; identical JSON payloads
 - 🩺 **Self-diagnosing** — `doctor` probes every ioctl step by step; an acceptance script measures all targets on real hardware
 
-> **v1 scope:** filename/path search only. Full-text content search, pinyin matching, and ReFS/network drives are out of scope.
+> **Scope notes:** content search ships as a query-time live scan (`content:` terms — no
+> background indexing, nothing on disk; PDF/legacy binary Office/ANSI encodings
+> unsupported). It reads files **as the service account**, so locally signed-in users can
+> read snippets their own token cannot open — see the security boundary in
+> [docs/deploy.en.md](docs/deploy.en.md). Still out of scope: a background full-text
+> index, pinyin matching, and ReFS/network drives.
 
 ## 📊 Performance
 
@@ -56,6 +62,7 @@ cargo run --release -p wfs-server -- console
 cargo run --release -p wfs-client -- search "*.rs"     # named pipe
 cargo run --release -p wfs-client -- status --http     # HTTP channel (loads the token itself)
 cargo run --release -p wfs-client -- search "src\core" --match-path   # match on path
+cargo run --release -p wfs-client -- search "*.md content:deploy"     # search inside documents
 $tok = Get-Content "$env:ProgramData\WFSearch\http.token"
 curl "http://127.0.0.1:15100/api/v1/search?q=report&limit=10" -H "x-wfs-token: $tok"
 
@@ -71,7 +78,9 @@ powershell -ExecutionPolicy Bypass -File scripts\acceptance.ps1
 
 **REPL** — type a query, or `status` / `quit`. **Query syntax** — `report *.docx C:`:
 terms are ANDed; wildcards and drive filters work; a term containing `\` or `/` matches on
-the path automatically, or force it with `--match-path`.
+the path automatically, or force it with `--match-path`; a `content:term` scans the
+*contents* of whatever the other terms let through (narrow by filename first — see
+[docs/protocol.en.md](docs/protocol.en.md)).
 
 **Volume won't come up?** Ask the doctor (elevated; prints each ioctl's result, exit code 1 on failure):
 
@@ -105,26 +114,55 @@ Web ──127.0.0.1 HTTP──► wfs-server
 - **🧹 Deletes** — tombstone marking (subtree BFS); a rebuild reclaims memory once the
   tombstone ratio crosses a threshold.
 
+## 📄 Document content search (v0.2)
+
+A `content:term` turns any query into a document-content search:
+
+```powershell
+wfs-cli search "*.md content:deploy"     # markdown files containing "deploy"
+wfs-cli search "report content:预算 C:"   # ANDs freely with name / path / drive terms
+```
+
+- **🔎 Live scan, zero index** — the name-level terms first narrow candidates to a window
+  (default 2 000 files), then each candidate is opened and matched in real time. Nothing
+  is written to disk, no background CPU, and results are always current with the index.
+- **📝 Formats** — plain text (UTF-8 / UTF-16 via BOM; NUL-byte sniffing skips binaries)
+  and OOXML/ODF containers (`.docx` `.docm` `.xlsx` `.xlsm` `.pptx` `.pptm` `.odt` `.ods`
+  `.odp`): the document XML is unzipped and stripped to text. PDF and legacy binary
+  Office are not supported.
+- **🧾 Rich hits** — each result carries a `snippet` around the first hit plus a per-file
+  match count; the response summarizes the scan (scanned / skipped-by-size / binary /
+  errors, with `truncated` and `timed_out` flags for partial coverage).
+- **⏱️ Bounded by design** — per-file size cap (8 MiB), per-scan time budget (10 s), and
+  a small reader pool that never competes with the name search's rayon threads. Tune it
+  all in the `[content]` config section; `enabled = false` switches it off entirely.
+- **🔐 Security** — files are opened **as the service account** (LocalSystem for the
+  service), so a query can read snippets the calling user could not open themselves. The
+  engine logs a loud startup warning while content search is on under `acl = open`; the
+  boundary and both knobs are documented in [docs/deploy.en.md](docs/deploy.en.md).
+
 ## ✅ Verification status
 
 | Area | Status | Evidence |
 |---|---|---|
-| Query engine (matching, sorting, path matching) | ✅ Verified | 20 unit tests + criterion benchmarks (synthetic 1M) |
+| Query engine (matching, sorting, path matching) | ✅ Verified | 28 unit tests + criterion benchmarks (synthetic 1M) |
 | Protocol JSON contract (pipe & HTTP payloads) | ✅ Verified | contract tests + pipe/HTTP end-to-end tests |
+| Document content scan (text + OOXML/ODF, budgets, truncation) | ✅ Verified | 16 wfs-content tests + real-file end-to-end in server tests; live on a 1.8 M-file machine |
 | Snapshot format (write / validate / reject) | ✅ Verified | round-trip + corrupt/foreign-version rejection tests |
 | Full MFT enum, USN journal incrementals | ✅ Verified | real-disk acceptance: build + change visibility < 100 ms; byte-level parsing tests (incl. FRN sequence-bit regression) |
 | Performance & memory targets (5 of 6) | ✅ Verified (one machine) | acceptance script: five gates PASS (table above); idle CPU not covered |
-| Service / SCM lifecycle | 🚧 Implemented, unverified | needs an on-machine `sc create` + `sc start` run |
-| Full-text, pinyin, ReFS/network drives | ❌ Not in v1 | out of scope |
+| Service / SCM lifecycle | ✅ Verified (one machine) | `sc create` + in-place exe swap (stop → rename → drop in → start) run on real hardware |
+| Background full-text index, pinyin, ReFS/network drives | ❌ Not in scope | content search is query-time scanning; an inverted index remains out |
 
 ## 📁 Repository layout
 
 ```
 crates/
-├── wfs-proto/    protocol types (JSON serde) shared by both transports — 6 contract tests
-├── wfs-core/     in-memory index + query engine (pure logic) — 20 unit tests + criterion bench
-├── wfs-fs/       MFT enum, USN Journal (hand-written kernel32 FFI, byte-level parsing) — 17 unit tests
-├── wfs-server/   service binary: console/service modes, pipe+http, snapshots, SCM — 11 tests
+├── wfs-proto/    protocol types (JSON serde) shared by both transports — 7 contract tests
+├── wfs-core/     in-memory index + query engine (pure logic) — 28 unit tests + criterion bench
+├── wfs-fs/       MFT enum, USN Journal (hand-written kernel32 FFI, byte-level parsing) — 23 unit tests
+├── wfs-content/  document-content extraction & matching (BOM text, OOXML/ODF, snippets) — 16 tests
+├── wfs-server/   service binary: console/service modes, pipe+http, snapshots, SCM, content scan — 34 tests
 └── wfs-client/   Rust SDK (reference client) + wfs-cli debug tool — 3 tests
 scripts/
 └── acceptance.ps1   real-disk acceptance: doctor + cold/warm start, latency, visibility
@@ -145,6 +183,13 @@ pipe_name = "\\\\.\\pipe\\wfs-engine-v1"
 poll_ms = 100              # journal poll interval
 max_limit = 1000           # per-query limit cap
 acl = "open"               # who may reach the engine: open (default) | restricted
+
+[content]                  # document-content search (`content:` terms)
+enabled = true             # false rejects content: queries outright
+max_candidates = 2000      # candidate window per scan
+max_file_bytes = 8388608   # per-file cap (8 MiB)
+timeout_ms = 10000         # per-scan time budget
+max_concurrency = 4        # concurrent file readers
 ```
 
 > 💡 `acl = "restricted"` limits **both** channels to SYSTEM + Administrators. `open` means
@@ -163,11 +208,15 @@ acl = "open"               # who may reach the engine: open (default) | restrict
 | 🧩 Client examples (Python / C# / Rust) | [clients.en.md](docs/clients.en.md) | [clients.md](docs/clients.md) |
 | 📈 Benchmarks & acceptance results | [benchmarks.en.md](docs/benchmarks.en.md) | [benchmarks.md](docs/benchmarks.md) |
 
-## ⚠️ Known limits (v1)
+## ⚠️ Known limits
 
 - 🔐 Requires elevation (LocalSystem has it; console mode needs an elevated terminal).
 - 💾 NTFS fixed disks only — USN Journal limitation; ReFS/network drives unsupported.
 - 🐢 **Path matching** (`match_path`, or `\` / `/` inside a term) and `sort=name|path`
   materialize the full path per candidate — 5–10× slower than name matching; name matching
   is the fast path.
+- 🔎 **Content search** covers plain text + OOXML/ODF only — no PDF, legacy binary
+  Office (`.doc`/`.xls`/`.ppt`), ANSI/GBK encodings, or encrypted containers. A query
+  with no name-level terms scans an arbitrary index-order window: narrow by filename
+  first. It reads files as the service account — see the security note above.
 - 📏 File size / mtime are not indexed (raw MFT record parsing could add them later).

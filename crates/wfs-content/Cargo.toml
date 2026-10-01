@@ -1,0 +1,11 @@
+[package]
+name = "wfs-content"
+description = "Document-content extraction and matching for WFSearch: text detection, OOXML/ODF container text, snippet building. Pure logic — no file IO."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wfs-core = { workspace = true }
+memchr = { workspace = true }
+zip = { workspace = true }

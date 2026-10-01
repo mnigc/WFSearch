@@ -12,6 +12,6 @@ pub use engine::{
 pub use index::{
     InsertOutcome, NamePool, Node, RenameOutcome, VolumeIndex, FLAG_DELETED, FLAG_DIR, ROOT_FRN,
 };
-pub use matcher::{Query, SortKind, Term};
+pub use matcher::{Query, SortKind, Substr, Term};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

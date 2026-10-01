@@ -65,17 +65,18 @@ https://github.com/mnigc/WFSearch/releases/latest/download/latest.json
 
 ```jsonc
 {
-  "version": "0.1.1", "tag": "v0.1.1", "protocol": 1,
-  "released_at": "2026-09-27T07:48:08Z",
+  "version": "0.2.0", "tag": "v0.2.0", "protocol": 2,
+  "released_at": "2026-10-01T00:00:00Z",
   "assets": {
-    "wfs-server.exe": { "url": "…/releases/download/v0.1.1/wfs-server.exe",
+    "wfs-server.exe": { "url": "…/releases/download/v0.2.0/wfs-server.exe",
                         "sha256": "9408…f8b6", "size": 3483136 }
   }
 }
 ```
 
 `url` pins one version (use it if you want a staged rollout); `protocol` is what a host checks
-for capabilities. The exe is also always reachable as
+for capabilities (protocol 2 adds `content:` document search; its additions are optional
+fields, backward-compatible with v1 clients). The exe is also always reachable as
 `releases/latest/download/wfs-server.exe` for whoever wants the newest build.
 
 ### Replacing the file: stop → rename → drop in → start
@@ -185,12 +186,39 @@ progress); a snapshot is written automatically once the build finishes, and ever
 exit afterwards (service stop / Ctrl-C) refreshes it. On restart, a volume whose journal
 has not wrapped recovers in seconds; otherwise it rebuilds automatically.
 
+## Content search (the `[content]` config section)
+
+A `content:` term in `q` triggers a query-time document-content scan (syntax and semantics
+in [protocol.en.md](protocol.en.md)). It builds **no index and performs no background IO**:
+each query first narrows candidates by name, then reads those files in real time. The
+defaults suit interactive use; tighten them for batch or embedded scenarios:
+
+```toml
+[content]
+enabled = true            # false makes content: queries fail with code 1
+max_candidates = 2000     # candidate window: at most this many name matches are scanned
+max_file_bytes = 8388608  # per-file cap (bytes); larger files land in skipped_size
+timeout_ms = 10000        # per-scan budget; when spent, partial results carry timed_out
+max_concurrency = 4       # concurrent readers (deliberately separate from the rayon pool
+                          # the name search uses — keep it small)
+```
+
+**Security boundary**: content search hands every process that can reach the engine the
+extra ability to **read file contents as the service account (SYSTEM)** — a name query
+only lists names, a content query opens the files. For local integration (pipe via DACL,
+HTTP via token) that is barely more than what the caller could read on its own; but if the
+indexed scope holds data the callers cannot otherwise read, combine
+`acl = "restricted"` with, where appropriate, `content.enabled = false`. The engine's own
+data directory (`config.toml`/`index.bin`/`http.token`) is never scanned.
+
 ## Query verification
 
 ```powershell
 wfs-cli.exe search "*.docx"
 wfs-cli.exe search "report C: 2026" --limit 50 --sort name
 wfs-cli.exe search "src\core" --match-path         # whole-path matching
+wfs-cli.exe search "*.md content:budget" --limit 10 # document-content search (narrow by
+                                                    # name first, then a live scan)
 wfs-cli.exe search "*.md" --http                     # via the HTTP channel (loads http.token)
 wfs-cli.exe search "*.md" --http --token <value>     # when the data dir is not the default
 wfs-cli.exe status

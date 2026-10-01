@@ -19,6 +19,18 @@ pub struct App {
 pub fn boot(config: Config) -> anyhow::Result<App> {
     let state = AppState::try_new(config)?;
 
+    // Content search opens files as this process's account (LocalSystem for
+    // the service), so under the default `acl = open` every locally signed-in
+    // user can read content snippets their own token cannot open. The boundary
+    // and both knobs (`acl`, `[content] enabled`) are in docs/deploy.md.
+    if state.config.content.enabled && !state.config.acl_restricted() {
+        tracing::warn!(
+            "content search is ON under acl=open: locally signed-in users can read \
+             file-content snippets as this account (SYSTEM). Tighten with acl=\"restricted\" \
+             or disable via [content] enabled=false — see docs/deploy.md"
+        );
+    }
+
     // warm start: restore whatever the snapshot can cover
     let resumed: HashMap<char, JournalPos> = snapshot::try_load(&state);
 

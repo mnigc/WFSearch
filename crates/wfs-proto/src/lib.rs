@@ -5,7 +5,10 @@
 use serde::{Deserialize, Serialize};
 pub use wfs_core::SortKind;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+/// v2: content search (`content:` terms in `q`; optional `content` scan info
+/// on `SearchResp`, optional `snippet`/`content_matches` on `FileResult`).
+/// All additions are optional fields, so v1 clients keep working.
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const DEFAULT_PIPE_NAME: &str = r"\\.\pipe\wfs-engine-v1";
 pub const DEFAULT_HTTP_PORT: u16 = 15100;
 
@@ -57,6 +60,32 @@ pub struct FileResult {
     pub name: String,
     pub path: String,
     pub is_dir: bool,
+    /// content-search context around the first hit; absent on name searches
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+    /// content-search hit count in this file; absent on name searches
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_matches: Option<u32>,
+}
+
+/// Bookkeeping for a `content:` query's scan phase. `total_matched` counts
+/// content matches; every candidate the scan saw is accounted for in one of
+/// the counters below.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContentScanInfo {
+    /// candidates that were read and matched against
+    pub scanned: u32,
+    /// candidates larger than the configured per-file cap
+    pub skipped_size: u32,
+    /// candidates rejected as binary
+    pub skipped_binary: u32,
+    /// candidates that could not be read or parsed (locked, corrupt…)
+    pub errors: u32,
+    /// the name-level matches exceeded the candidate window, so not every
+    /// matching file was scanned — narrow the name terms for full coverage
+    pub truncated: bool,
+    /// the time budget ran out before all candidates were scanned
+    pub timed_out: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +95,9 @@ pub struct SearchResp {
     pub limit: u32,
     pub offset: u32,
     pub results: Vec<FileResult>,
+    /// present only for `content:` queries (`query_ms` includes the scan)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<ContentScanInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -225,9 +257,15 @@ mod tests {
                 name: "notes.txt".into(),
                 path: r"C:\work\notes.txt".into(),
                 is_dir: false,
+                snippet: None,
+                content_matches: None,
             }],
+            content: None,
         });
         let j = serde_json::to_string(&resp).unwrap();
+        // a name search keeps the v1 wire shape exactly: no content keys
+        assert!(!j.contains("snippet"), "{j}");
+        assert!(!j.contains("content"), "{j}");
         match serde_json::from_str::<Response>(&j).unwrap() {
             Response::Search(r) => {
                 assert_eq!(r.total_matched, 2);
@@ -236,5 +274,40 @@ mod tests {
             }
             other => panic!("expected search, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn content_fields_appear_only_when_present() {
+        let resp = Response::Search(SearchResp {
+            total_matched: 1,
+            query_ms: 5,
+            limit: 100,
+            offset: 0,
+            results: vec![FileResult {
+                name: "a.docx".into(),
+                path: r"C:\work\a.docx".into(),
+                is_dir: false,
+                snippet: Some("…Q3 预算…".into()),
+                content_matches: Some(3),
+            }],
+            content: Some(ContentScanInfo {
+                scanned: 7,
+                skipped_size: 1,
+                skipped_binary: 2,
+                errors: 0,
+                truncated: false,
+                timed_out: false,
+            }),
+        });
+        let j = serde_json::to_string(&resp).unwrap();
+        assert!(j.contains(r#""snippet":"…Q3 预算…""#), "{j}");
+        assert!(j.contains(r#""content_matches":3"#), "{j}");
+        assert!(j.contains(r#""content":{"scanned":7"#), "{j}");
+        let back = match serde_json::from_str::<Response>(&j).unwrap() {
+            Response::Search(r) => r,
+            other => panic!("expected search, got {other:?}"),
+        };
+        assert_eq!(back.content.unwrap().scanned, 7);
+        assert_eq!(back.results[0].content_matches, Some(3));
     }
 }

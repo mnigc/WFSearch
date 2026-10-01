@@ -129,6 +129,41 @@ let r = wfs_client::search_http(&SearchReq { q: "*.md".into(), ..Default::defaul
 Every `SearchReq` field except `q` has a default: `limit=100`, `offset=0`,
 `sort=SortKind::None`, `match_path=false`.
 
+## Content search (protocol v2)
+
+Put `content:term` in `q` to search document contents: the remaining terms narrow the
+candidate set to the window, then the files are read and matched in real time. Probe
+`status.protocol >= 2` first; the response gains optional `results[].snippet`,
+`results[].content_matches`, and a top-level `content` scan summary. A query without
+`content:` carries none of these fields — its wire shape is byte-identical to v1.
+
+```python
+r = call(f, {"op": "search", "args": {"q": "*.md content:deploy", "limit": 10}})
+for item in r["results"]:
+    print(" ", item["path"])
+    print("   ", item.get("snippet", ""), f"({item.get('content_matches', 0)} hits)")
+info = r.get("content") or {}
+if info.get("truncated"):
+    print("warning: candidate window exhausted — narrow the name terms")
+if info.get("timed_out"):
+    print("warning: scan budget ran out — results are partial")
+```
+
+```rust
+// Document-content search: the response carries snippet / content_matches /
+// a content scan summary
+let r = c.search(&SearchReq { q: "*.md content:deploy".into(), ..Default::default() }).unwrap();
+for f in &r.results {
+    println!("{} — {:?}", f.path, f.snippet);
+}
+```
+
+Notes: `total_matched` then counts **content matches**, `limit`/`offset` page over them,
+and `query_ms` includes the scan (seconds are possible — call asynchronously). The
+candidate window defaults to 2 000 files — narrow by filename first or the window
+truncates. Format coverage and the security boundary live in
+[protocol.en.md](protocol.en.md) and [deploy.en.md](deploy.en.md).
+
 ## Integration notes
 
 1. **Reuse connections**: a pipe connection can carry many requests (one frame each) —
@@ -147,3 +182,6 @@ Every `SearchReq` field except `q` has a default: `limit=100`, `offset=0`,
    only SYSTEM + Administrators (everyone else gets "access denied"), and `http.token` is
    readable only by them, so HTTP yields 401 for the rest. Under the default `open`, anyone
    signed in at the console can use both.
+7. **Content search**: a `content:` term triggers a document-content scan (v2, section
+   above); the server can disable it entirely with `[content] enabled = false`, which
+   surfaces as `code: 1`.

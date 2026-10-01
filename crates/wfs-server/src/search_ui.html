@@ -54,6 +54,14 @@
   .opts label { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
   .opts select { color: var(--tx); background: var(--card2); border: 1px solid var(--line);
                  border-radius: 6px; padding: 3px 6px; font-size: 13px; outline: none; }
+  .crow { display: flex; gap: 10px; align-items: center; margin-top: 10px; }
+  .clabel { flex: none; font-size: 13px; color: var(--tx2); }
+  #cq { flex: 1; height: 36px; padding: 0 13px; font-size: 14px; color: var(--tx);
+        background: var(--card2); border: 1px solid var(--line); border-radius: 8px;
+        outline: none; transition: border-color .15s, box-shadow .15s; }
+  #cq::placeholder { color: var(--tx3); }
+  #cq:focus { border-color: var(--acc2); box-shadow: 0 0 0 3px #0e6fc040; }
+  #cq:not(:placeholder-shown) { border-color: #1a84dd88; }
   .busy { color: var(--acc); }
   .hint { margin-top: 12px; font-size: 12.5px; color: var(--tx3); }
   .hidden { display: none !important; }
@@ -94,6 +102,8 @@
   .fname { font-size: 14.5px; word-break: break-all; }
   .fpath { font-family: var(--mono); font-size: 12px; color: var(--tx2);
            word-break: break-all; }
+  .fsnip { margin-top: 3px; font-size: 12.5px; color: #9fb4c7; }
+  .fsnip .hits { color: var(--tx3); font-size: 11.5px; margin-left: 6px; }
   mark { background: #0078d445; color: #bfe3ff; border-radius: 3px; padding: 0 1px; }
   .copy { flex: none; height: 26px; padding: 0 10px; font-size: 12px; color: var(--tx2);
           background: var(--card2); border: 1px solid var(--line); border-radius: 6px;
@@ -121,8 +131,13 @@
   <section class="card searchbox">
     <div class="srow">
       <input id="q" autofocus autocomplete="off" spellcheck="false"
-             placeholder="搜索文件名,如:report *.docx,或按路径:src\core">
+             placeholder="搜索文件名,如:report *.docx;或搜文档内容:*.md content:关键词">
       <button id="go">搜索</button>
+    </div>
+    <div class="crow">
+      <span class="clabel">📄 文档内容</span>
+      <input id="cq" autocomplete="off" spellcheck="false"
+             placeholder="在文档内容里找(可选):关键词,空格分词 AND;覆盖 txt/md/源码/docx/xlsx/pptx">
     </div>
     <div class="opts">
       <label><input type="checkbox" id="mp"> 按路径匹配(慢 5–10×)</label>
@@ -143,13 +158,15 @@
     </div>
     <div class="hint">
       空格 = 多词 AND · <code>*</code> / <code>?</code> 通配符 · 词含 <code>\</code> 或 <code>/</code>
-      自动按路径匹配 · 词首 <code>C:</code> 过滤盘符 · 大小写 / Unicode 折叠
+      自动按路径匹配 · 词首 <code>C:</code> 过滤盘符 · <code>content:词</code> 搜文档内容
+      (txt/md/源码/docx/xlsx/pptx,先用文件名缩小范围) · 大小写 / Unicode 折叠
     </div>
     <div class="ex">试试:
       <button data-q="*.rs">*.rs</button>
       <button data-q="*.docx">*.docx</button>
       <button data-q="C: report">C: report</button>
       <button data-q="src\core">src\core</button>
+      <button data-q="*.md content:部署">*.md content:部署</button>
     </div>
   </section>
 
@@ -164,6 +181,8 @@
       <button id="next">下一页 ›</button>
     </span>
   </section>
+
+  <div id="notes"></div>
 
   <ul id="results" class="results hidden"></ul>
   <section id="state" class="card state hidden"></section>
@@ -259,8 +278,9 @@ function renderAuth() {
 
 /* ---------- search ---------- */
 function tokens() {
-  return $('#q').value.trim().split(/\s+/)
-    .map(w => w.replace(/[*?]/g, '')).filter(w => w.length > 0);
+  return fullQuery().split(/\s+/)
+    .map(w => w.replace(/^content:/i, '').replace(/[*?]/g, ''))
+    .filter(w => w.length > 0);
 }
 function hi(name) {
   let out = esc(name);
@@ -271,15 +291,30 @@ function hi(name) {
 }
 function query() {
   const p = new URLSearchParams();
-  p.set('q', $('#q').value.trim());
+  p.set('q', fullQuery());
   p.set('limit', pageLimit);
   p.set('offset', offset);
   p.set('sort', $('#sort').value);
   if ($('#mp').checked) p.set('match_path', '1');
   return p.toString();
 }
+/* The name box plus the content box form one q: every word in the content box
+   is sent as a `content:` term (AND semantics, same as typing it manually). */
+function fullQuery() {
+  let q = $('#q').value.trim();
+  const cq = $('#cq').value.trim();
+  if (cq) q += ' ' + cq.split(/\s+/).map(w => 'content:' + w).join(' ');
+  return q;
+}
+/* Inverse of fullQuery for restoring from the URL hash. */
+function splitQuery(q) {
+  const words = q.split(/\s+/).filter(Boolean);
+  const cq = words.filter(w => /^content:/i.test(w)).map(w => w.slice(8)).join(' ');
+  const rest = words.filter(w => !/^content:/i.test(w)).join(' ');
+  return [rest, cq];
+}
 async function run() {
-  const q = $('#q').value.trim();
+  const q = fullQuery();
   if (!q) { idle(); return; }
   inflight++; $('#busy').classList.remove('hidden');
   const t0 = performance.now();
@@ -298,6 +333,7 @@ async function run() {
   }
 }
 function show(el) { [$('#meta'), $('#results'), $('#state')].forEach(x => x.classList.add('hidden'));
+  $('#notes').innerHTML = '';
   if (el) el.classList.remove('hidden'); }
 function idle() {
   show($('#state'));
@@ -318,16 +354,32 @@ function render(r, rt) {
   $('#results').innerHTML = r.results.map(f =>
     `<li><span class="ico">${f.is_dir ? '📁' : '📄'}</span>` +
     `<span class="fmain"><div class="fname">${hi(f.name)}</div>` +
-    `<div class="fpath">${esc(f.path)}</div></span>` +
+    `<div class="fpath">${esc(f.path)}</div>` +
+    (f.snippet
+      ? `<div class="fsnip">${hi(f.snippet)}<span class="hits">${f.content_matches} 处命中</span></div>`
+      : '') +
+    `</span>` +
     `<button class="copy" data-p="${esc(f.path)}">复制路径</button></li>`).join('');
   $('#count').innerHTML = '共 <b>' + fmt(total) + '</b> 个匹配';
-  $('#lat').textContent =
-    `引擎 ${r.query_ms} ms · 往返 ${rt.toFixed(0)} ms`;
+  let lat = `引擎 ${r.query_ms} ms · 往返 ${rt.toFixed(0)} ms`;
+  if (r.content) {
+    lat += ` · 扫描 ${r.content.scanned} 个文件` +
+      (r.content.skipped_size ? ` · 跳过大文件 ${r.content.skipped_size}` : '') +
+      (r.content.skipped_binary ? ` · 二进制 ${r.content.skipped_binary}` : '') +
+      (r.content.errors ? ` · 失败 ${r.content.errors}` : '');
+  }
+  $('#lat').textContent = lat;
   $('#meta').classList.remove('hidden');
   const lo = offset + 1, hiN = offset + r.results.length;
   $('#page').textContent = fmt(lo) + '–' + fmt(hiN) + ' / ' + fmt(total);
   $('#prev').disabled = offset === 0;
   $('#next').disabled = hiN >= total;
+  const notes = [];
+  if (r.content && r.content.truncated)
+    notes.push('候选窗口已用满,未覆盖全部文件名匹配 —— 请加文件名条件缩小范围');
+  if (r.content && r.content.timed_out)
+    notes.push('扫描预算用尽,结果不完整 —— 缩小范围或调大 [content] timeout_ms');
+  $('#notes').innerHTML = notes.map(n => `<div class="banner warn">⏳ ${n}</div>`).join('');
 }
 function rerun() { offset = 0; run(); }
 
@@ -337,6 +389,11 @@ $('#q').addEventListener('input', () => {
   debounce = setTimeout(rerun, 250);
 });
 $('#q').addEventListener('keydown', e => { if (e.key === 'Enter') { clearTimeout(debounce); rerun(); } });
+$('#cq').addEventListener('input', () => {
+  clearTimeout(debounce);
+  debounce = setTimeout(rerun, 400);
+});
+$('#cq').addEventListener('keydown', e => { if (e.key === 'Enter') { clearTimeout(debounce); rerun(); } });
 $('#go').addEventListener('click', rerun);
 for (const id of ['mp', 'sort', 'limit']) {
   $(('#' + id)).addEventListener('change', () => { pageLimit = +$('#limit').value; rerun(); });
@@ -344,7 +401,11 @@ for (const id of ['mp', 'sort', 'limit']) {
 $('#prev').addEventListener('click', () => { offset = Math.max(0, offset - pageLimit); run(); });
 $('#next').addEventListener('click', () => { offset = offset + pageLimit; run(); });
 document.querySelectorAll('.ex button').forEach(b =>
-  b.addEventListener('click', () => { $('#q').value = b.dataset.q; rerun(); }));
+  b.addEventListener('click', () => {
+    const [rest, cq] = splitQuery(b.dataset.q);
+    $('#q').value = rest; $('#cq').value = cq;
+    rerun();
+  }));
 $('#results').addEventListener('click', e => {
   const b = e.target.closest('.copy');
   if (!b) return;
@@ -355,12 +416,20 @@ $('#results').addEventListener('click', e => {
 });
 window.addEventListener('hashchange', () => {
   const q = decodeURIComponent(location.hash.replace(/^#q=/, ''));
-  if (q && q !== $('#q').value) { $('#q').value = q; rerun(); }
+  if (q && q !== fullQuery()) {
+    const [rest, cq] = splitQuery(q);
+    $('#q').value = rest; $('#cq').value = cq;
+    rerun();
+  }
 });
 
 /* ---------- boot ---------- */
 const initial = decodeURIComponent(location.hash.replace(/^#q=/, ''));
-if (initial) { $('#q').value = initial; run(); } else { idle(); }
+if (initial) {
+  const [rest, cq] = splitQuery(initial);
+  $('#q').value = rest; $('#cq').value = cq;
+  run();
+} else { idle(); }
 refreshStatus();
 setInterval(refreshStatus, 3000);
 </script>

@@ -126,6 +126,38 @@ let r = wfs_client::search_http(&SearchReq { q: "*.md".into(), ..Default::defaul
 
 `SearchReq` 除 `q` 外都有默认值:`limit=100`、`offset=0`、`sort=SortKind::None`、`match_path=false`。
 
+## 内容检索(protocol v2)
+
+`q` 里写 `content:词` 即搜文档内容:先用其余词把候选收敛到窗口,再实时读取文件匹配。
+调用方应先探测 `status.protocol >= 2`;响应多出可选字段 `results[].snippet`、
+`results[].content_matches`、顶层 `content`(扫描统计)。不带 `content:` 的查询不含这些
+字段,wire 形状与 v1 完全一致。
+
+```python
+r = call(f, {"op": "search", "args": {"q": "*.md content:部署", "limit": 10}})
+for item in r["results"]:
+    print(" ", item["path"])
+    print("   ", item.get("snippet", ""), f"({item.get('content_matches', 0)} hits)")
+info = r.get("content") or {}
+if info.get("truncated"):
+    print("warning: candidate window exhausted — narrow the name terms")
+if info.get("timed_out"):
+    print("warning: scan budget ran out — results are partial")
+```
+
+```rust
+// 文档内容检索:响应携带 snippet / content_matches / content 扫描统计
+let r = c.search(&SearchReq { q: "*.md content:部署".into(), ..Default::default() }).unwrap();
+for f in &r.results {
+    println!("{} — {:?}", f.path, f.snippet);
+}
+```
+
+要点:`total_matched` 此时是**内容匹配**数,`limit`/`offset` 分页作用于内容匹配之后;
+`query_ms` 含扫描耗时(秒级可能,建议异步调用);候选窗口默认 2000 个文件——先用文件名
+条件缩小范围,否则窗口截断。格式覆盖与安全边界见 [protocol.md](protocol.md) 与
+[deploy.md](deploy.md)。
+
 ## 接入要点
 
 1. **复用连接**:pipe 连接建立后可连续发多个请求(每请求一帧),避免反复连接。
@@ -135,3 +167,4 @@ let r = wfs_client::search_http(&SearchReq { q: "*.md".into(), ..Default::defaul
    另有仅 HTTP 出现的 `code: 4`(token 缺失或不对 → `401`)。
 5. **路径匹配**:查询词里含 `\` 或 `/` 的词会自动按路径匹配;要按路径匹配**全部**词则设 `match_path=true`(Named Pipe)或 `match_path=true`(HTTP 查询参数)。只搜文件名时不要开,慢 5~10×。
 6. **权限**:`acl = "restricted"` 同时收紧两个通道 —— pipe 仅 SYSTEM + Administrators 可连(普通用户收到"拒绝访问"),`http.token` 也只有这几类用户读得到(其他人拿 HTTP 只会吃到 401)。默认 `open` 下本机登录用户两个通道都能用。
+7. **内容检索**:`content:` 词触发文档内容扫描(v2,见上节);服务端可用 `[content] enabled = false` 整体关闭,此时返回 `code: 1`。

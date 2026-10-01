@@ -8,6 +8,7 @@ use wfs_proto::{
     ERR_BAD_REQUEST, PROTOCOL_VERSION,
 };
 
+use crate::content;
 use crate::state::AppState;
 
 pub fn handle_request(state: &AppState, req: Request) -> Response {
@@ -26,6 +27,11 @@ pub fn search_resp(state: &AppState, sr: SearchReq) -> Result<SearchResp, (u32, 
         return Err((ERR_BAD_REQUEST, "query must not be empty".into()));
     }
     let query = Query::parse(&sr.q);
+    // `content:` terms route to the query-time document scan; everything else
+    // is the plain name/path path below.
+    if !query.content_terms.is_empty() {
+        return content::search(state, &query, &sr);
+    }
     let opts = SearchOptions {
         limit: sr.limit.clamp(1, state.config.max_limit),
         offset: sr.offset,
@@ -41,6 +47,8 @@ pub fn search_resp(state: &AppState, sr: SearchReq) -> Result<SearchResp, (u32, 
             name: e.name,
             path: e.path,
             is_dir: e.is_dir,
+            snippet: None,
+            content_matches: None,
         })
         .collect();
     Ok(SearchResp {
@@ -49,6 +57,7 @@ pub fn search_resp(state: &AppState, sr: SearchReq) -> Result<SearchResp, (u32, 
         limit: opts.limit,
         offset: opts.offset,
         results,
+        content: None,
     })
 }
 

@@ -36,7 +36,7 @@ fn http_token(cli: &Cli) -> anyhow::Result<String> {
 #[derive(Subcommand)]
 enum Command {
     /// search files by name (terms AND'ed; supports * and ? wildcards; "c:" filters a drive;
-    /// terms containing \ or / match the full path)
+    /// terms containing \ or / match the full path; "content:term" scans document contents)
     Search {
         query: String,
         #[arg(long, default_value_t = 20)]
@@ -85,9 +85,22 @@ fn main() -> anyhow::Result<()> {
                 resp.query_ms,
                 resp.results.len()
             );
+            if let Some(c) = &resp.content {
+                if c.truncated {
+                    println!(
+                        "  note: candidate window exhausted — narrow the name terms for full coverage"
+                    );
+                }
+                if c.timed_out {
+                    println!("  note: scan budget ran out — results are partial");
+                }
+            }
             for f in &resp.results {
                 let tag = if f.is_dir { "  [DIR]" } else { "" };
                 println!("  {}{tag}", f.path);
+                if let Some(sn) = &f.snippet {
+                    println!("      {sn}  ({} in file)", f.content_matches.unwrap_or(0));
+                }
             }
         }
         Command::Status => {

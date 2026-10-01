@@ -21,6 +21,53 @@ pub struct Config {
     /// HTTP gateway shared the setting.
     #[serde(alias = "pipe_acl")]
     pub acl: String,
+    /// document-content search (`content:` terms) — see `ContentConfig`
+    pub content: ContentConfig,
+}
+
+/// Query-time document-content scan budgets. Nothing here is persisted state:
+/// the scan reads candidate files per request, so these values only bound
+/// latency and IO, and every field can be tuned without touching the index.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContentConfig {
+    /// `content:` queries return an error when false
+    pub enabled: bool,
+    /// candidate window: at most this many name-matched files are scanned;
+    /// beyond it `truncated` is reported instead of scanning unbounded
+    pub max_candidates: u32,
+    /// files larger than this are skipped (`skipped_size`)
+    pub max_file_bytes: u64,
+    /// wall-clock budget for one scan; `timed_out` reports partial coverage
+    pub timeout_ms: u64,
+    /// concurrent file readers (kept small so scans never starve the rayon
+    /// pool the name search shares)
+    pub max_concurrency: u32,
+}
+
+impl Default for ContentConfig {
+    fn default() -> Self {
+        ContentConfig {
+            enabled: true,
+            max_candidates: 2_000,
+            max_file_bytes: 8 << 20,
+            timeout_ms: 10_000,
+            max_concurrency: 4,
+        }
+    }
+}
+
+impl ContentConfig {
+    /// Clamp out-of-range values (a hand-edited TOML must not produce a
+    /// zero-budget or unbounded scan); the loud-warning style of
+    /// `normalize_acl` is not needed for plain numeric ranges.
+    pub fn normalized(mut self) -> ContentConfig {
+        self.max_candidates = self.max_candidates.clamp(1, 1_000_000);
+        self.max_file_bytes = self.max_file_bytes.clamp(1, 1 << 30);
+        self.timeout_ms = self.timeout_ms.clamp(100, 600_000);
+        self.max_concurrency = self.max_concurrency.clamp(1, 16);
+        self
+    }
 }
 
 impl Default for Config {
@@ -33,6 +80,7 @@ impl Default for Config {
             poll_ms: 100,
             max_limit: 1000,
             acl: "open".into(),
+            content: ContentConfig::default(),
         }
     }
 }
@@ -58,6 +106,7 @@ impl Config {
             Err(_) => Config::default(),
         };
         cfg.normalize_acl();
+        cfg.content = cfg.content.clone().normalized();
         cfg
     }
 
@@ -141,5 +190,28 @@ mod tests {
         );
         c.data_dir = Some("D:\\wfsdata".into());
         assert_eq!(c.token_path(), PathBuf::from("D:\\wfsdata\\http.token"));
+    }
+
+    #[test]
+    fn content_section_defaults_when_absent() {
+        let c = loaded("noc", "drives = [\"C\"]\n");
+        assert!(c.content.enabled);
+        assert_eq!(c.content.max_candidates, 2_000);
+        assert_eq!(c.content.max_file_bytes, 8 << 20);
+        assert_eq!(c.content.timeout_ms, 10_000);
+        assert_eq!(c.content.max_concurrency, 4);
+    }
+
+    #[test]
+    fn content_section_parses_and_normalizes() {
+        let c = loaded(
+            "content",
+            "[content]\nenabled = false\nmax_candidates = 0\nmax_concurrency = 99\ntimeout_ms = 1\n",
+        );
+        assert!(!c.content.enabled);
+        // out-of-range values are clamped into sane bounds
+        assert_eq!(c.content.max_candidates, 1);
+        assert_eq!(c.content.max_concurrency, 16);
+        assert_eq!(c.content.timeout_ms, 100);
     }
 }

@@ -1,6 +1,12 @@
 [中文](protocol.md) | [English](protocol.en.md)
 
-# WFSearch Wire Protocol v1
+# WFSearch Wire Protocol v2
+
+> What changed in v2: a `content:` term in `q` triggers a document-content
+> scan; `SearchResp` gains optional `content`, and `FileResult` gains optional
+> `snippet`/`content_matches`. Everything added is an **optional field** — the
+> wire shape of a query without `content:` is byte-identical to v1, so v1
+> clients are unaffected. New clients can probe `status.protocol >= 2`.
 
 Two transports carry identical payloads (JSON, UTF-8):
 
@@ -36,7 +42,8 @@ Every field except `q` is optional; `limit` defaults to 100, `offset` to 0, `sor
 `none`, `match_path` to `false`.
 
 `q` syntax: whitespace-separated terms ANDed; each term is a substring
-(case-insensitive, Unicode-folded) or a `*`/`?` wildcard; a standalone `c:` filters by drive.
+(case-insensitive, Unicode-folded) or a `*`/`?` wildcard; a standalone `c:` filters by drive;
+a `content:term` prefix (case-insensitive) triggers a document-content scan, see below.
 
 `sort`: `none` (default, index order) | `name` | `path` (the latter two must collect every
 hit first — slower on large result sets).
@@ -50,6 +57,52 @@ Path matching requires materializing the full path for every candidate — 5–1
 name matching (measured in [benchmarks.en.md](benchmarks.en.md)); avoid it when a filename
 search suffices.
 
+### Content search: `content:` terms
+
+A `content:term` in `q` adds a **query-time document-content scan** on top of the name
+search:
+
+* **Flow**: the remaining terms (name / path / drive) first narrow the candidates down to
+  the candidate window (default 2 000, configurable); the scan then reads those files'
+  contents in real time. **With no filename constraints the candidate set is the whole
+  index**, which the window truncates (`truncated: true`) — narrow by filename first.
+* **Content terms**: foldcase substrings (same semantics as name terms, CJK included), no
+  wildcards; multiple `content:` terms AND; each term is a single whitespace-separated
+  token, no phrase syntax.
+* **Formats covered**: plain text (txt/md/log/csv/source code; BOM-detected UTF-8/UTF-16,
+  no BOM means UTF-8, a NUL byte anywhere means binary → skipped) and OOXML/ODF containers
+  (.docx/.docm/.xlsx/.xlsm/.pptx/.pptm/.odt/.ods/.odp — the document XML members are
+  unzipped and stripped to text). **Not supported**: PDF, legacy binary Office
+  (.doc/.xls/.ppt), GBK/ANSI encodings, encrypted containers.
+* **Semantic change**: `total_matched` now counts **content matches**; `limit`/`offset`
+  page over the content matches; `query_ms` includes the scan (which can take seconds —
+  the transports already run it off their reactor threads).
+
+```jsonc
+{"type": "search", "data": {
+    "total_matched": 3,
+    "query_ms": 812,
+    "limit": 100, "offset": 0,
+    "results": [{"name": "a.docx", "path": "C:\\work\\a.docx", "is_dir": false,
+                 "snippet": "…Q3 budget plan…", "content_matches": 4}],
+    "content": {"scanned": 42, "skipped_size": 1, "skipped_binary": 3,
+                "errors": 0, "truncated": false, "timed_out": false}
+}}
+```
+
+Every scanned candidate lands in exactly one `content` counter: `scanned` (read and
+matched), `skipped_size` (over the per-file cap, default 8 MiB), `skipped_binary`
+(rejected as binary), `errors` (unreadable or unparseable — deleted/renamed between
+indexing and opening, exclusively locked; routine, not a fault). `truncated` means the
+candidate window cut the scan short (narrow the name terms for full coverage);
+`timed_out` means the scan budget (default 10 s) ran out and results are partial.
+`snippet` is the context around the first hit (~64 chars each side, whitespace collapsed,
+`…` for elided text); `content_matches` is the total hit count in that file.
+
+Guards and switches (disable entirely, window, size cap, budget, concurrency) live in the
+`[content]` section of [deploy.en.md](deploy.en.md); files under the engine's own data
+directory are never scanned.
+
 ### Responses
 
 ```jsonc
@@ -60,7 +113,7 @@ search suffices.
     "results": [{"name": "a.docx", "path": "C:\\work\\2026\\a.docx", "is_dir": false}]
 }}
 {"type": "status", "data": {
-    "version": "0.1.0", "protocol": 1, "uptime_ms": 54321,
+    "version": "0.2.0", "protocol": 2, "uptime_ms": 54321,
     "approx_memory_bytes": 98000000,
     "volumes": [{"drive": "C", "phase": "ready", "files": 1234567,
                  "deleted": 12, "journal": true, "last_update_ms_ago": 350}]}

@@ -59,16 +59,17 @@ https://github.com/mnigc/WFSearch/releases/latest/download/latest.json
 
 ```jsonc
 {
-  "version": "0.1.1", "tag": "v0.1.1", "protocol": 1,
-  "released_at": "2026-09-27T07:48:08Z",
+  "version": "0.2.0", "tag": "v0.2.0", "protocol": 2,
+  "released_at": "2026-10-01T00:00:00Z",
   "assets": {
-    "wfs-server.exe": { "url": "…/releases/download/v0.1.1/wfs-server.exe",
+    "wfs-server.exe": { "url": "…/releases/download/v0.2.0/wfs-server.exe",
                         "sha256": "9408…f8b6", "size": 3483136 }
   }
 }
 ```
 
-`url` 指向固定版本(想灰度就别追 latest),`protocol` 供宿主判断能力。exe 也始终可以用
+`url` 指向固定版本(想灰度就别追 latest),`protocol` 供宿主判断能力(v2 起支持 `content:`
+文档内容检索,可选字段向后兼容 v1 客户端)。exe 也始终可以用
 `releases/latest/download/wfs-server.exe` 直接拿最新版。
 
 ### 换文件:停 → 改名 → 落新 → 起
@@ -156,12 +157,34 @@ volume C:
 
 首次启动:逐盘全量枚举(期间 `/status` 显示 `building` 与进度);构建完成自动落一次快照;之后每次优雅退出(服务停止 / Ctrl-C)都会刷新快照。重启时若 journal 未回绕则秒级恢复,否则该盘自动重建。
 
+## 内容检索(`[content]` 配置段)
+
+`q` 里的 `content:` 词触发查询时文档内容扫描(语法与语义见 [protocol.md](protocol.md))。
+它**不建任何索引、不做后台 IO**:每次查询先按文件名收敛候选,再实时读取候选文件内容。
+默认值适合交互式使用;批量/嵌入式场景按需收紧:
+
+```toml
+[content]
+enabled = true            # false 时 content: 查询直接返回 code 1 错误
+max_candidates = 2000     # 候选窗口:最多扫这么多文件名命中的文件,超出置 truncated
+max_file_bytes = 8388608  # 单文件上限(字节),超出计入 skipped_size
+timeout_ms = 10000        # 单次扫描预算,用尽返回部分结果并置 timed_out
+max_concurrency = 4       # 并发读取线程数(刻意与名字搜索的 rayon 池分开,保持小值)
+```
+
+**安全边界**:内容检索让"能连上引擎的进程"额外获得"以服务账户(SYSTEM)身份读文件内容"
+的能力——文件名查询只列名字,内容查询会真的打开文件。本机集成场景(管道按 DACL、HTTP 按
+token 鉴权)下这与调用方自己读文件差别不大;但如果索引范围里有调用方自身权限读不到的
+数据,请组合使用:`acl = "restricted"` 收紧连接面,必要时 `content.enabled = false`
+整体关闭。引擎自身数据目录(`config.toml`/`index.bin`/`http.token`)永不参与内容扫描。
+
 ## 查询验证
 
 ```powershell
 wfs-cli.exe search "*.docx"
 wfs-cli.exe search "report C: 2026" --limit 50 --sort name
 wfs-cli.exe search "src\core" --match-path         # 整条路径匹配
+wfs-cli.exe search "*.md content:部署" --limit 10   # 文档内容检索(先文件名收敛,再实时扫描)
 wfs-cli.exe search "*.md" --http                     # 走 HTTP 通道(自己读 http.token)
 wfs-cli.exe search "*.md" --http --token <值>         # 数据目录非默认时手动给 token
 wfs-cli.exe status

@@ -13,6 +13,7 @@ path = "src/main.rs"
 wfs-core = { workspace = true }
 wfs-proto = { workspace = true }
 wfs-fs = { workspace = true }
+wfs-content = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }
@@ -28,3 +29,5 @@ tracing-subscriber = { workspace = true }
 [dev-dependencies]
 # the end-to-end tests drive the real transports through the public SDK
 wfs-client = { workspace = true }
+# content-search tests build real OOXML fixtures
+zip = { workspace = true }

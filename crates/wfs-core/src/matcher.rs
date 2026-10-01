@@ -85,49 +85,51 @@ impl Substr {
     }
 
     pub fn matches(&self, name: &[u8]) -> bool {
+        self.find(name).is_some()
+    }
+
+    /// Byte offset of the first match, or `None`. `name` must be valid UTF-8
+    /// (NamePool bytes and extracted document text both are); the returned
+    /// offset is always a char boundary.
+    pub fn find(&self, name: &[u8]) -> Option<usize> {
         if self.pat.is_empty() {
-            return true;
+            return Some(0);
         }
         if !self.ascii.is_empty() {
-            self.match_ascii(name)
+            self.find_ascii(name)
         } else {
-            self.match_hinted(name)
+            self.find_hinted(name)
         }
     }
 
     /// All-ASCII pattern: seed candidate positions with both cases of the
     /// first byte (memchr2), then compare the window case-insensitively.
-    fn match_ascii(&self, name: &[u8]) -> bool {
+    fn find_ascii(&self, name: &[u8]) -> Option<usize> {
         let pat = &self.ascii[..];
         let plen = pat.len();
         let first = pat[0];
         for s in memchr2_iter(first, first.to_ascii_uppercase(), name) {
             if s + plen > name.len() {
-                return false;
+                return None;
             }
             if name[s..s + plen]
                 .iter()
                 .zip(pat)
                 .all(|(a, b)| a.to_ascii_lowercase() == *b)
             {
-                return true;
+                return Some(s);
             }
         }
-        false
+        None
     }
 
     /// Non-ASCII-led pattern: seed with the first UTF-8 byte (always a char
     /// boundary — UTF-8 continuation bytes are < 0xC0), then folded char
     /// verify. ASCII lead bytes seed with both cases.
-    fn match_hinted(&self, name: &[u8]) -> bool {
+    fn find_hinted(&self, name: &[u8]) -> Option<usize> {
         let first = self.hint;
         let alt = first.to_ascii_uppercase();
-        for s in memchr2_iter(first, alt, name) {
-            if self.match_at(name, s) {
-                return true;
-            }
-        }
-        false
+        memchr2_iter(first, alt, name).find(|&s| self.match_at(name, s))
     }
 
     fn match_at(&self, name: &[u8], start: usize) -> bool {
@@ -307,17 +309,38 @@ impl Term {
 /// path; every other term matches the file name only. Materializing paths is
 /// far more expensive than scanning names, so path terms are always applied
 /// after the name terms have already filtered the candidate down.
+///
+/// A `content:xxx` term (case-insensitive prefix) does not constrain file
+/// names at all: it requests a document-content scan of whatever candidates
+/// the name/path/drive terms let through. Content terms are foldcase
+/// substrings — wildcards are not supported there.
 #[derive(Debug, Clone, Default)]
 pub struct Query {
     /// matched against the file name
     pub terms: Vec<Term>,
     /// matched against the full path
     pub path_terms: Vec<Term>,
+    /// matched against the file content (triggers a content scan)
+    pub content_terms: Vec<String>,
     pub drives: Vec<char>,
 }
 
 fn is_path_token(tok: &str) -> bool {
     tok.contains('\\') || tok.contains('/')
+}
+
+/// `content:` prefix, case-insensitive (matching Windows' general
+/// case-insensitivity); the rest of the token is the content term.
+fn content_term_of(tok: &str) -> Option<&str> {
+    const PREFIX: &str = "content:";
+    if tok.len() > PREFIX.len()
+        && tok.as_bytes()[PREFIX.len() - 1] == b':'
+        && tok[..PREFIX.len() - 1].eq_ignore_ascii_case("content")
+    {
+        Some(&tok[PREFIX.len()..])
+    } else {
+        None
+    }
 }
 
 impl Query {
@@ -327,6 +350,10 @@ impl Query {
             let b = tok.as_bytes();
             if b.len() == 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
                 q.drives.push((b[0] as char).to_ascii_lowercase());
+                continue;
+            }
+            if let Some(term) = content_term_of(tok) {
+                q.content_terms.push(term.to_string());
                 continue;
             }
             if tok.is_empty() {
@@ -429,6 +456,39 @@ mod tests {
         let q2 = Query::parse("　全角空格　test");
         assert_eq!(q2.terms.len(), 2); // U+3000 splits too
         assert!(Query::parse("").is_empty());
+    }
+
+    #[test]
+    fn query_parse_content_terms() {
+        let q = Query::parse("*.docx content:预算");
+        assert_eq!(q.content_terms, vec!["预算"]);
+        assert_eq!(q.terms.len(), 1); // the wildcard stays a name term
+                                      // prefix is case-insensitive; like every term, a content term is a
+                                      // single whitespace-separated token (no phrase syntax)
+        assert_eq!(Query::parse("Content:Q3").content_terms, vec!["Q3"]);
+        // multiple content terms AND together
+        assert_eq!(Query::parse("content:a content:b").content_terms.len(), 2);
+        // a bare `content:` carries no term and is dropped
+        assert!(Query::parse("content:").content_terms.is_empty());
+        // the old behavior is preserved: without the prefix this is a name term
+        let old = Query::parse("content");
+        assert!(old.content_terms.is_empty() && old.terms.len() == 1);
+        // a content term does not make the name-level query non-empty
+        assert!(Query::parse("content:x").is_empty());
+    }
+
+    #[test]
+    fn substr_find_returns_hit_offset() {
+        let p = sub("Report");
+        assert_eq!(p.find(b"Q3 Report final"), Some(3));
+        assert_eq!(p.find(b"REPORT.TXT"), Some(0));
+        assert_eq!(p.find(b"rep.txt"), None);
+        // offset lands on a char boundary inside CJK text
+        let cjk = sub("文件夹");
+        assert_eq!(cjk.find("项目文件夹.txt".as_bytes()), Some(6));
+        assert_eq!(cjk.find("项目文档.txt".as_bytes()), None);
+        // empty pattern matches at offset 0
+        assert_eq!(sub("").find(b"anything"), Some(0));
     }
 
     #[test]

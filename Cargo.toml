@@ -4,12 +4,13 @@ members = [
     "crates/wfs-proto",
     "crates/wfs-core",
     "crates/wfs-fs",
+    "crates/wfs-content",
     "crates/wfs-server",
     "crates/wfs-client",
 ]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 
@@ -30,9 +31,12 @@ bincode = "1.3"
 toml = "0.8"
 anyhow = "1"
 criterion = "0.5"
+# document-content search: zip containers only (deflate via pure-Rust zlib-rs)
+zip = { version = "8", default-features = false, features = ["deflate"] }
 wfs-proto = { path = "crates/wfs-proto" }
 wfs-core = { path = "crates/wfs-core" }
 wfs-fs = { path = "crates/wfs-fs" }
+wfs-content = { path = "crates/wfs-content" }
 wfs-client = { path = "crates/wfs-client" }
 
 [profile.release]

@@ -1,7 +1,7 @@
 //! The multi-volume engine: owns per-volume state (index + journal position
 //! + incremental event application) and executes queries with rayon.
 
-use crate::index::{InsertOutcome, Node, RenameOutcome, VolumeIndex, FLAG_DELETED};
+use crate::index::{InsertOutcome, Node, RenameOutcome, VolumeIndex, FLAG_DELETED, FLAG_DIR};
 use crate::matcher::{Query, SortKind, Term};
 use parking_lot::RwLock;
 use rayon::prelude::*;
@@ -111,6 +111,10 @@ pub struct SearchHit {
 pub struct SearchOutput {
     pub hits: Vec<SearchHit>,
     pub total_matched: u64,
+    /// non-directory matches. `total_matched` counts directories too; a
+    /// content scan only ever opens files, so its truncation verdict must be
+    /// judged against this.
+    pub non_dir_matched: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -263,6 +267,7 @@ impl Engine {
         let g = self.inner.read();
         let mut hits: Vec<SearchHit> = Vec::new();
         let mut total: u64 = 0;
+        let mut non_dir: u64 = 0;
 
         // Terms that must match the file name (cheap) and terms that must match
         // the materialized path. AND order does not change the result, so path
@@ -319,6 +324,10 @@ impl Engine {
                     })
                     .collect();
                 total += collected.len() as u64;
+                non_dir += collected
+                    .iter()
+                    .filter(|&&s| nodes[s as usize].flags & FLAG_DIR == 0)
+                    .count() as u64;
                 if collected.len() > MAX_SORT_COLLECT {
                     collected.sort_unstable();
                     collected.truncate(MAX_SORT_COLLECT);
@@ -329,30 +338,35 @@ impl Engine {
                     .offset
                     .saturating_add(opts.limit)
                     .min(MAX_SORT_COLLECT as u32) as usize;
-                let chunk_hits: Vec<(u64, Vec<u32>)> = nodes
+                let chunk_hits: Vec<(u64, u64, Vec<u32>)> = nodes
                     .par_chunks(CHUNK)
                     .enumerate()
                     .map(|(ci, chunk)| {
                         let base = (ci * CHUNK) as u32;
                         let mut out = Vec::new();
                         let mut cnt: u64 = 0;
+                        let mut nd: u64 = 0;
                         for (i, node) in chunk.iter().enumerate() {
                             if node.flags & FLAG_DELETED != 0 {
                                 continue;
                             }
                             if qualifies(base + i as u32, node) {
                                 cnt += 1;
+                                if node.flags & FLAG_DIR == 0 {
+                                    nd += 1;
+                                }
                                 if out.len() < cap {
                                     out.push(base + i as u32);
                                 }
                             }
                         }
-                        (cnt, out)
+                        (cnt, nd, out)
                     })
                     .collect();
                 let mut merged: Vec<u32> = Vec::with_capacity(chunk_hits.len() * cap.min(64));
-                for (cnt, mut part) in chunk_hits {
+                for (cnt, nd, mut part) in chunk_hits {
                     total += cnt;
+                    non_dir += nd;
                     merged.append(&mut part);
                 }
                 merged.sort_unstable();
@@ -379,6 +393,7 @@ impl Engine {
         SearchOutput {
             hits: sliced,
             total_matched: total,
+            non_dir_matched: non_dir,
         }
     }
 
@@ -627,6 +642,7 @@ mod tests {
         };
         let out = engine.search(&Query::parse("file"), &opts);
         assert_eq!(out.total_matched, 300);
+        assert_eq!(out.non_dir_matched, 300, "all matches are files here");
         assert_eq!(out.hits.len(), 10);
         let e = engine.materialize(&out.hits);
         assert_eq!(e[0].name, "file005.txt");
@@ -635,9 +651,10 @@ mod tests {
         // drive filter excluding everything
         let out = engine.search(&Query::parse("d:"), &SearchOptions::default());
         assert_eq!(out.total_matched, 0);
-        // drive filter including
+        // drive filter including: 300 files + the root directory
         let out = engine.search(&Query::parse("c:"), &SearchOptions::default());
         assert_eq!(out.total_matched, 301);
+        assert_eq!(out.non_dir_matched, 300);
     }
 
     #[test]
